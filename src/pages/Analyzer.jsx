@@ -26,7 +26,7 @@ async function fetchComments(videoId) {
   let pageToken = ''
   let pages = 0
 
-  while (pages < 3) {
+  while (pages < 1) {
     const url = `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=100&order=relevance${pageToken ? `&pageToken=${pageToken}` : ''}&key=${YOUTUBE_API_KEY}`
     const res = await fetch(url)
     if (!res.ok) {
@@ -52,7 +52,12 @@ async function fetchComments(videoId) {
 }
 
 async function analyzeWithGroq(comments) {
-  const commentText = comments
+  // Limit to 60 comments and truncate long ones to stay within token limits
+  const trimmed = comments
+    .slice(0, 60)
+    .map(c => ({ ...c, text: c.text.slice(0, 200) }))
+
+  const commentText = trimmed
     .map((c, i) => `[${i + 1}] @${c.author} (👍 ${c.likes}): ${c.text}`)
     .join('\n')
 
