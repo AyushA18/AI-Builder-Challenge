@@ -10,8 +10,8 @@ const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
 const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
-const MAX_COMMENTS = 1500      // safety cap so one video can't fetch forever / blow quota
-const ANALYZE_SAMPLE = 50      // max comments sent to Groq for analysis — keeps us under TPM limits
+const MAX_COMMENTS = 1500       // safety cap so one video can't fetch forever / blow quota
+const ANALYZE_SAMPLE = 50       // comments randomly sampled and sent to Groq — keeps us under TPM limits
 const LS_GROQ = 'pixelforge_groq_key'
 
 // ─── HELPERS: YOUTUBE ────────────────────────────────────────────────────────
@@ -139,23 +139,23 @@ function dedupeToxic(arr) {
   return out
 }
 
-// "Map" step: extract raw signal from one chunk of comments.
-function buildExtractPrompt(chunk) {
-  const commentText = chunk
+// Build the single extraction prompt for all 50 sampled comments.
+function buildExtractPrompt(comments) {
+  const commentText = comments
     .map((c, i) => `[${i + 1}] @${c.author} (👍 ${c.likes}): ${c.text.slice(0, 200)}`)
     .join('\n')
 
-  return `You are analyzing a subset of YouTube comments (${chunk.length} comments below) as part of a larger batch job. Extract raw signal only — do not write a final summary, another step will combine all batches later.
+  return `You are analyzing ${comments.length} YouTube comments. Extract raw signal from them.
 
 COMMENTS:
 ${commentText}
 
 Return ONLY valid JSON, no markdown, no explanation:
 {
-  "sentimentCounts": {"positive": <number of comments>, "neutral": <number of comments>, "negative": <number of comments>},
-  "questions": ["<distinct question seen in these comments>"],
+  "sentimentCounts": {"positive": <number>, "neutral": <number>, "negative": <number>},
+  "questions": ["<distinct question seen in comments>"],
   "painPoints": ["<pain point or complaint mentioned>"],
-  "contentIdeas": ["<content idea implied by these comments>"],
+  "contentIdeas": ["<content idea implied by comments>"],
   "phrases": ["<notable recurring phrase or slang>"],
   "topComment": {"author": "<username>", "text": "<comment text>", "likes": <number>},
   "toxicComments": [{"author": "<username>", "text": "<comment>", "reason": "<why it's toxic>"}]
@@ -163,42 +163,9 @@ Return ONLY valid JSON, no markdown, no explanation:
 (Arrays can be empty. Include at most 5 items per array except toxicComments.)`
 }
 
-function mergeBatchResults(a, b) {
-  return {
-    sentimentCounts: {
-      positive: (a.sentimentCounts?.positive || 0) + (b.sentimentCounts?.positive || 0),
-      neutral: (a.sentimentCounts?.neutral || 0) + (b.sentimentCounts?.neutral || 0),
-      negative: (a.sentimentCounts?.negative || 0) + (b.sentimentCounts?.negative || 0),
-    },
-    questions: [...(a.questions || []), ...(b.questions || [])],
-    painPoints: [...(a.painPoints || []), ...(b.painPoints || [])],
-    contentIdeas: [...(a.contentIdeas || []), ...(b.contentIdeas || [])],
-    phrases: [...(a.phrases || []), ...(b.phrases || [])],
-    topComment: (a.topComment?.likes || 0) >= (b.topComment?.likes || 0) ? a.topComment : b.topComment,
-    toxicComments: [...(a.toxicComments || []), ...(b.toxicComments || [])],
-  }
-}
-
-// Analyzes one chunk. If Groq rejects it (rate limit / too large / bad request),
-// the chunk automatically splits in half and retries — so it keeps shrinking
-// until it fits, instead of just failing or silently truncating.
-async function analyzeChunk(chunk, apiKey) {
-  try {
-    return await callGroq(apiKey, [{ role: 'user', content: buildExtractPrompt(chunk) }], 1200)
-  } catch (e) {
-    const looksLikeSizeOrRateIssue =
-      e.status === 413 || e.status === 429 || e.status === 400 ||
-      /token|too large|context|rate.?limit/i.test(e.message || '')
-    if (chunk.length > 5 && looksLikeSizeOrRateIssue) {
-      const mid = Math.ceil(chunk.length / 2)
-      const [ra, rb] = await Promise.all([
-        analyzeChunk(chunk.slice(0, mid), apiKey),
-        analyzeChunk(chunk.slice(mid), apiKey),
-      ])
-      return mergeBatchResults(ra, rb)
-    }
-    throw e
-  }
+// Sends all sampled comments to Groq in a single call.
+async function analyzeChunk(comments, apiKey) {
+  return await callGroq(apiKey, [{ role: 'user', content: buildExtractPrompt(comments) }], 1200)
 }
 
 // "Reduce" step: turn the aggregated candidates into the final polished report.
@@ -452,7 +419,7 @@ function LoadingPulse({ message }) {
         🔥
       </div>
       <p style={{ color: '#EF9F27', fontWeight: 600, fontSize: 16 }}>{message}</p>
-      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>Larger comment sections are processed in batches of 60 — this may take a bit longer</p>
+      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>Analyzing a random sample of {ANALYZE_SAMPLE} comments…</p>
       <style>{`@keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }`}</style>
     </div>
   )
@@ -1024,7 +991,7 @@ export default function Analyzer() {
             </p>
           )}
           <p style={{ fontSize: 11, color: '#3A3328', marginTop: 10 }}>
-            Works with any public YouTube video · Fetches up to {MAX_COMMENTS} comments and analyzes all of them in batches of {BATCH_SIZE}
+            Works with any public YouTube video · Randomly samples {ANALYZE_SAMPLE} comments for analysis
           </p>
         </div>
       )}
