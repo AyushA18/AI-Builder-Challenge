@@ -1,12 +1,19 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-// 👇 ADD YOUR GROQ API KEY IN YOUR .env FILE AS: VITE_GROQ_API_KEY=your_key_here
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY
-const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
+// 👇 These are used as the DEFAULT keys. Users can override them with their own
+// keys in the Settings panel — theirs are stored only in their browser (localStorage)
+// and used instead of these whenever present.
+const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
+const DEFAULT_YT_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const BATCH_SIZE = 60          // comments per Groq call during the "map" step
+const MAX_COMMENTS = 1500      // safety cap so one video can't fetch forever / blow quota
+const LS_GROQ = 'pixelforge_groq_key'
+const LS_YT = 'pixelforge_yt_key'
+
+// ─── HELPERS: YOUTUBE ────────────────────────────────────────────────────────
 function extractVideoId(url) {
   const patterns = [
     /(?:youtube\.com\/watch\?v=)([^&\n?#]+)/,
@@ -21,16 +28,17 @@ function extractVideoId(url) {
   return null
 }
 
-async function fetchComments(videoId) {
+// Fetches every available top-level comment (paginating through the YouTube API)
+// instead of stopping after the first page or two.
+async function fetchComments(videoId, ytKey, onProgress) {
   let comments = []
   let pageToken = ''
-  let pages = 0
 
-  while (pages < 1) {
-    const url = `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=100&order=relevance${pageToken ? `&pageToken=${pageToken}` : ''}&key=${YOUTUBE_API_KEY}`
+  while (comments.length < MAX_COMMENTS) {
+    const url = `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=100&order=relevance${pageToken}&key=${ytKey}`
     const res = await fetch(url)
     if (!res.ok) {
-      const err = await res.json()
+      const err = await res.json().catch(() => ({}))
       throw new Error(err.error?.message || 'Failed to fetch comments')
     }
     const data = await res.json()
@@ -40,103 +48,262 @@ async function fetchComments(videoId) {
         author: s.authorDisplayName,
         text: s.textDisplay.replace(/<[^>]*>/g, ''),
         likes: s.likeCount,
-        authorChannel: s.authorChannelUrl || '',
       })
     }
-    if (data.nextPageToken && pages < 2) {
+    onProgress?.(comments.length)
+    if (data.nextPageToken) {
       pageToken = `&pageToken=${data.nextPageToken}`
-      pages++
-    } else break
+    } else {
+      break
+    }
   }
-  return comments
+  return comments.slice(0, MAX_COMMENTS)
 }
 
-async function analyzeWithGroq(comments) {
-  // Limit to 60 comments and truncate long ones to stay within token limits
-  const trimmed = comments
-    .slice(0, 60)
-    .map(c => ({ ...c, text: c.text.slice(0, 200) }))
-
-  const commentText = trimmed
-    .map((c, i) => `[${i + 1}] @${c.author} (👍 ${c.likes}): ${c.text}`)
-    .join('\n')
-
-  const prompt = `You are an expert YouTube audience analyst. Analyze the following ${comments.length} comments from a YouTube video and return a detailed JSON report.
-
-COMMENTS:
-${commentText}
-
-Return ONLY valid JSON with exactly this structure (no markdown, no explanation):
-{
-  "sentiment": {
-    "positive": <number 0-100>,
-    "neutral": <number 0-100>,
-    "negative": <number 0-100>,
-    "summary": "<one sentence overall vibe>"
-  },
-  "topQuestions": [
-    {"question": "<question text>", "frequency": "<how many asked similar>"},
-    {"question": "...", "frequency": "..."},
-    {"question": "...", "frequency": "..."},
-    {"question": "...", "frequency": "..."},
-    {"question": "...", "frequency": "..."}
-  ],
-  "contentIdeas": [
-    {"idea": "<content idea>", "basis": "<which comments inspired this>"},
-    {"idea": "...", "basis": "..."},
-    {"idea": "...", "basis": "..."},
-    {"idea": "...", "basis": "..."},
-    {"idea": "...", "basis": "..."}
-  ],
-  "painPoints": [
-    {"point": "<pain point>", "mentions": "<approximate count>"},
-    {"point": "...", "mentions": "..."},
-    {"point": "...", "mentions": "..."}
-  ],
-  "topComment": {
-    "author": "<username>",
-    "text": "<comment text>",
-    "likes": <number>,
-    "whyItResonated": "<explanation>"
-  },
-  "audiencePhrases": [
-    "<phrase 1>", "<phrase 2>", "<phrase 3>", "<phrase 4>", "<phrase 5>",
-    "<phrase 6>", "<phrase 7>", "<phrase 8>"
-  ],
-  "nextVideoIdeas": [
-    {"title": "<video title idea>", "reason": "<why audience wants this>"},
-    {"title": "...", "reason": "..."},
-    {"title": "...", "reason": "..."}
-  ],
-  "toxicComments": [
-    {"author": "<username>", "text": "<the comment>", "reason": "<why it's toxic>"},
-    {"author": "...", "text": "...", "reason": "..."}
-  ]
-}`
-
+// ─── HELPERS: GROQ ───────────────────────────────────────────────────────────
+async function callGroq(apiKey, messages, maxTokens = 2000) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${GROQ_API_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages: [{ role: 'user', content: prompt }],
+      messages,
       temperature: 0.3,
-      max_tokens: 3000,
+      max_tokens: maxTokens,
     }),
   })
-
   if (!res.ok) {
-    const err = await res.json()
-    throw new Error(err.error?.message || 'Groq API error')
+    const err = await res.json().catch(() => ({}))
+    const msg = err.error?.message || `Groq API error (${res.status})`
+    const e = new Error(msg)
+    e.status = res.status
+    throw e
   }
-
   const data = await res.json()
   const raw = data.choices[0].message.content.trim()
   const clean = raw.replace(/```json|```/g, '').trim()
   return JSON.parse(clean)
+}
+
+function dedupe(arr) {
+  const seen = new Set()
+  const out = []
+  for (const item of arr || []) {
+    const key = (item || '').toLowerCase().trim()
+    if (key && !seen.has(key)) {
+      seen.add(key)
+      out.push(item)
+    }
+  }
+  return out
+}
+
+function dedupeToxic(arr) {
+  const seen = new Set()
+  const out = []
+  for (const item of arr || []) {
+    const key = `${item.author}|${item.text}`.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(item)
+    }
+  }
+  return out
+}
+
+// "Map" step: extract raw signal from one chunk of comments.
+function buildExtractPrompt(chunk) {
+  const commentText = chunk
+    .map((c, i) => `[${i + 1}] @${c.author} (👍 ${c.likes}): ${c.text.slice(0, 200)}`)
+    .join('\n')
+
+  return `You are analyzing a subset of YouTube comments (${chunk.length} comments below) as part of a larger batch job. Extract raw signal only — do not write a final summary, another step will combine all batches later.
+
+COMMENTS:
+${commentText}
+
+Return ONLY valid JSON, no markdown, no explanation:
+{
+  "sentimentCounts": {"positive": <number of comments>, "neutral": <number of comments>, "negative": <number of comments>},
+  "questions": ["<distinct question seen in these comments>"],
+  "painPoints": ["<pain point or complaint mentioned>"],
+  "contentIdeas": ["<content idea implied by these comments>"],
+  "phrases": ["<notable recurring phrase or slang>"],
+  "topComment": {"author": "<username>", "text": "<comment text>", "likes": <number>},
+  "toxicComments": [{"author": "<username>", "text": "<comment>", "reason": "<why it's toxic>"}]
+}
+(Arrays can be empty. Include at most 5 items per array except toxicComments.)`
+}
+
+function mergeBatchResults(a, b) {
+  return {
+    sentimentCounts: {
+      positive: (a.sentimentCounts?.positive || 0) + (b.sentimentCounts?.positive || 0),
+      neutral: (a.sentimentCounts?.neutral || 0) + (b.sentimentCounts?.neutral || 0),
+      negative: (a.sentimentCounts?.negative || 0) + (b.sentimentCounts?.negative || 0),
+    },
+    questions: [...(a.questions || []), ...(b.questions || [])],
+    painPoints: [...(a.painPoints || []), ...(b.painPoints || [])],
+    contentIdeas: [...(a.contentIdeas || []), ...(b.contentIdeas || [])],
+    phrases: [...(a.phrases || []), ...(b.phrases || [])],
+    topComment: (a.topComment?.likes || 0) >= (b.topComment?.likes || 0) ? a.topComment : b.topComment,
+    toxicComments: [...(a.toxicComments || []), ...(b.toxicComments || [])],
+  }
+}
+
+// Analyzes one chunk. If Groq rejects it (rate limit / too large / bad request),
+// the chunk automatically splits in half and retries — so it keeps shrinking
+// until it fits, instead of just failing or silently truncating.
+async function analyzeChunk(chunk, apiKey) {
+  try {
+    return await callGroq(apiKey, [{ role: 'user', content: buildExtractPrompt(chunk) }], 1200)
+  } catch (e) {
+    const looksLikeSizeOrRateIssue =
+      e.status === 413 || e.status === 429 || e.status === 400 ||
+      /token|too large|context|rate.?limit/i.test(e.message || '')
+    if (chunk.length > 5 && looksLikeSizeOrRateIssue) {
+      const mid = Math.ceil(chunk.length / 2)
+      const [ra, rb] = await Promise.all([
+        analyzeChunk(chunk.slice(0, mid), apiKey),
+        analyzeChunk(chunk.slice(mid), apiKey),
+      ])
+      return mergeBatchResults(ra, rb)
+    }
+    throw e
+  }
+}
+
+// "Reduce" step: turn the aggregated candidates into the final polished report.
+function buildFinalSynthesisPrompt({ candidateQuestions, candidatePainPoints, candidateIdeas, candidatePhrases, topComment, sentiment, totalComments }) {
+  return `You analyzed ${totalComments} YouTube comments in batches and extracted these raw candidate signals across all of them. Now synthesize the FINAL polished report — merge duplicates/near-duplicates and keep only the strongest, most representative items.
+
+CANDIDATE QUESTIONS SEEN:
+${candidateQuestions.map(q => `- ${q}`).join('\n') || '(none)'}
+
+CANDIDATE PAIN POINTS:
+${candidatePainPoints.map(p => `- ${p}`).join('\n') || '(none)'}
+
+CANDIDATE CONTENT IDEAS:
+${candidateIdeas.map(c => `- ${c}`).join('\n') || '(none)'}
+
+CANDIDATE RECURRING PHRASES:
+${candidatePhrases.map(p => `- ${p}`).join('\n') || '(none)'}
+
+SENTIMENT BREAKDOWN (computed precisely from all ${totalComments} comments): ${sentiment.positive}% positive, ${sentiment.neutral}% neutral, ${sentiment.negative}% negative
+
+MOST-LIKED COMMENT: @${topComment.author} (👍 ${topComment.likes}): "${topComment.text}"
+
+Return ONLY valid JSON, no markdown, no explanation:
+{
+  "sentimentSummary": "<one sentence overall vibe consistent with the breakdown above>",
+  "topQuestions": [{"question": "...", "frequency": "..."}],
+  "painPoints": [{"point": "...", "mentions": "..."}],
+  "contentIdeas": [{"idea": "...", "basis": "..."}],
+  "audiencePhrases": ["...", "..."],
+  "nextVideoIdeas": [{"title": "...", "reason": "..."}],
+  "whyTopCommentResonated": "<one sentence explaining why the most-liked comment above resonated>"
+}
+(topQuestions: up to 5, painPoints: up to 3, contentIdeas: up to 5, audiencePhrases: up to 8, nextVideoIdeas: up to 3.)`
+}
+
+// Runs the full map-reduce pipeline over every fetched comment, 60 at a time.
+async function analyzeAllComments(comments, apiKey, onProgress) {
+  const chunks = []
+  for (let i = 0; i < comments.length; i += BATCH_SIZE) {
+    chunks.push(comments.slice(i, i + BATCH_SIZE))
+  }
+
+  let combined = null
+  for (let i = 0; i < chunks.length; i++) {
+    onProgress?.({ phase: 'batch', batch: i + 1, totalBatches: chunks.length, totalComments: comments.length })
+    const result = await analyzeChunk(chunks[i], apiKey)
+    combined = combined ? mergeBatchResults(combined, result) : result
+  }
+
+  const totalCounted =
+    combined.sentimentCounts.positive + combined.sentimentCounts.neutral + combined.sentimentCounts.negative || 1
+  const sentiment = {
+    positive: Math.round((combined.sentimentCounts.positive / totalCounted) * 100),
+    neutral: Math.round((combined.sentimentCounts.neutral / totalCounted) * 100),
+    negative: Math.round((combined.sentimentCounts.negative / totalCounted) * 100),
+  }
+
+  onProgress?.({ phase: 'synthesizing', totalComments: comments.length })
+  const topComment = combined.topComment || { author: 'unknown', text: '', likes: 0 }
+  const final = await callGroq(apiKey, [{
+    role: 'user',
+    content: buildFinalSynthesisPrompt({
+      candidateQuestions: dedupe(combined.questions).slice(0, 40),
+      candidatePainPoints: dedupe(combined.painPoints).slice(0, 40),
+      candidateIdeas: dedupe(combined.contentIdeas).slice(0, 40),
+      candidatePhrases: dedupe(combined.phrases).slice(0, 40),
+      topComment,
+      sentiment,
+      totalComments: comments.length,
+    }),
+  }], 2000)
+
+  return {
+    sentiment: { ...sentiment, summary: final.sentimentSummary },
+    topQuestions: final.topQuestions,
+    painPoints: final.painPoints,
+    contentIdeas: final.contentIdeas,
+    audiencePhrases: final.audiencePhrases,
+    nextVideoIdeas: final.nextVideoIdeas,
+    topComment: { ...topComment, whyItResonated: final.whyTopCommentResonated },
+    toxicComments: dedupeToxic(combined.toxicComments).slice(0, 10),
+  }
+}
+
+// ─── HELPERS: FILE DOWNLOAD / LOAD ──────────────────────────────────────────
+function downloadFile(filename, content, mime = 'text/plain') {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function buildMarkdownReport(report, meta) {
+  const lines = []
+  lines.push(`# Comment Intelligence Report`, '')
+  lines.push(`**Video:** ${meta.videoUrl}`)
+  lines.push(`**Comments analyzed:** ${meta.commentCount}`)
+  lines.push(`**Generated:** ${meta.generatedAt}`, '')
+  lines.push(`## Overall Sentiment`, report.sentiment.summary, '')
+  lines.push(`- Positive: ${report.sentiment.positive}%`)
+  lines.push(`- Neutral: ${report.sentiment.neutral}%`)
+  lines.push(`- Negative: ${report.sentiment.negative}%`, '')
+  lines.push(`## Most Resonant Comment`)
+  lines.push(`@${report.topComment.author} (👍 ${report.topComment.likes})`)
+  lines.push(`> ${report.topComment.text}`, '')
+  lines.push(`**Why it resonated:** ${report.topComment.whyItResonated}`, '')
+  lines.push(`## Top Questions`)
+  report.topQuestions.forEach((q, i) => lines.push(`${i + 1}. ${q.question} _(${q.frequency})_`))
+  lines.push('')
+  lines.push(`## Pain Points`)
+  report.painPoints.forEach(p => lines.push(`- ${p.point} (${p.mentions})`))
+  lines.push('')
+  lines.push(`## Content Ideas`)
+  report.contentIdeas.forEach((c, i) => lines.push(`${i + 1}. ${c.idea}\n   - From: ${c.basis}`))
+  lines.push('')
+  lines.push(`## Suggested Next Videos`)
+  report.nextVideoIdeas.forEach((v, i) => lines.push(`${i + 1}. **${v.title}** — ${v.reason}`))
+  lines.push('')
+  lines.push(`## Audience Phrases`)
+  lines.push(report.audiencePhrases.map(p => `\`${p}\``).join(', '), '')
+  if (report.toxicComments?.length) {
+    lines.push(`## Flagged Comments`)
+    report.toxicComments.forEach(t => lines.push(`- @${t.author}: "${t.text}" — _${t.reason}_`))
+  }
+  return lines.join('\n')
 }
 
 // ─── SUB COMPONENTS ──────────────────────────────────────────────────────────
@@ -208,9 +375,193 @@ function LoadingPulse({ message }) {
         🔥
       </div>
       <p style={{ color: '#EF9F27', fontWeight: 600, fontSize: 16 }}>{message}</p>
-      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>This takes about 10–15 seconds</p>
+      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>Larger comment sections are processed in batches of 60 — this may take a bit longer</p>
       <style>{`@keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }`}</style>
     </div>
+  )
+}
+
+// ─── SETTINGS (BRING-YOUR-OWN API KEY) ──────────────────────────────────────
+function SettingsPanel({ groqKey, ytKey, onSave }) {
+  const [open, setOpen] = useState(false)
+  const [g, setG] = useState(groqKey)
+  const [y, setY] = useState(ytKey)
+  const usingOwnGroq = !!groqKey.trim()
+
+  useEffect(() => { setG(groqKey); setY(ytKey) }, [groqKey, ytKey])
+
+  const inputStyle = {
+    width: '100%', padding: '10px 14px', borderRadius: 8,
+    border: '1px solid #2E2820', background: '#0F0E0C',
+    color: '#F0EBE3', fontSize: 13, outline: 'none',
+    fontFamily: 'JetBrains Mono, monospace', marginTop: 6, marginBottom: 14,
+  }
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'transparent', border: '1px solid #2E2820',
+          borderRadius: 8, padding: '8px 14px', color: '#7A7268',
+          fontSize: 13, fontWeight: 600,
+        }}
+      >
+        ⚙️ API Settings
+        {usingOwnGroq && (
+          <span style={{ color: '#4CAF7D', fontSize: 11, background: '#12251A', padding: '2px 8px', borderRadius: 999 }}>
+            using your key
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <Card style={{ marginTop: 12 }}>
+          <p style={{ fontSize: 12, color: '#7A7268', marginBottom: 16, lineHeight: 1.6 }}>
+            Optional — bring your own API keys instead of the shared demo keys. They're saved only in
+            your browser and sent straight to Groq / YouTube, never through our servers. Leave blank to
+            keep using the default.
+          </p>
+          <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your Groq API key</label>
+          <input type="password" value={g} onChange={e => setG(e.target.value)} placeholder="gsk_..." style={inputStyle} />
+          <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your YouTube Data API key</label>
+          <input type="password" value={y} onChange={e => setY(e.target.value)} placeholder="AIza..." style={inputStyle} />
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              onClick={() => { onSave(g.trim(), y.trim()); setOpen(false) }}
+              style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg,#D85A30,#EF9F27)', color: '#fff', fontWeight: 700, fontSize: 13 }}
+            >
+              Save
+            </button>
+            <button
+              onClick={() => { setG(''); setY(''); onSave('', '') }}
+              style={{ padding: '10px 20px', borderRadius: 8, border: '1px solid #2E2820', background: 'transparent', color: '#7A7268', fontWeight: 600, fontSize: 13 }}
+            >
+              Clear / use default
+            </button>
+          </div>
+        </Card>
+      )}
+    </div>
+  )
+}
+
+// ─── CHATBOT ─────────────────────────────────────────────────────────────────
+function ChatBot({ comments, report, apiKey, videoUrl }) {
+  const [messages, setMessages] = useState([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [chatError, setChatError] = useState('')
+  const bottomRef = useRef(null)
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  async function send() {
+    if (!input.trim() || loading) return
+    if (!apiKey) { setChatError('No Groq API key available for chat.'); return }
+    setChatError('')
+    const userMsg = { role: 'user', content: input.trim() }
+    const newMessages = [...messages, userMsg]
+    setMessages(newMessages)
+    setInput('')
+    setLoading(true)
+    try {
+      const sample = comments.slice(0, 400)
+      const commentCorpus = sample
+        .map(c => `@${c.author} (👍${c.likes}): ${c.text.slice(0, 180)}`)
+        .join('\n')
+
+      const systemPrompt = `You are a helpful assistant answering questions about the comment section of a YouTube video (${videoUrl}). You have an analysis report and a sample of ${sample.length} of the ${comments.length} total comments below. Answer the user's question directly and concisely, referencing specific commenters where useful. If the comments don't cover something, say so honestly rather than guessing.
+
+ANALYSIS REPORT SUMMARY:
+${JSON.stringify({ sentiment: report.sentiment, topQuestions: report.topQuestions, painPoints: report.painPoints, contentIdeas: report.contentIdeas })}
+
+COMMENTS SAMPLE:
+${commentCorpus}`
+
+      const data = await callGroq(apiKey, [
+        { role: 'system', content: systemPrompt },
+        ...newMessages,
+      ], 800).catch(async () => {
+        // callGroq expects JSON content; chat replies are plain text, so call the API directly here
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [{ role: 'system', content: systemPrompt }, ...newMessages],
+            temperature: 0.4,
+            max_tokens: 800,
+          }),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.error?.message || 'Chat request failed')
+        }
+        const json = await res.json()
+        return { __rawReply: json.choices[0].message.content.trim() }
+      })
+
+      const reply = data.__rawReply
+      setMessages(m => [...m, { role: 'assistant', content: reply }])
+    } catch (e) {
+      setMessages(m => [...m, { role: 'assistant', content: `⚠️ ${e.message}` }])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <SectionTitle icon="🤖" title="Ask Questions About These Comments" />
+      <div style={{ maxHeight: 320, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
+        {messages.length === 0 && (
+          <p style={{ fontSize: 13, color: '#7A7268' }}>
+            Try: "What do people want in the next video?" or "Are there recurring complaints?"
+          </p>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} style={{
+            alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+            maxWidth: '80%', padding: '10px 14px', borderRadius: 10,
+            background: m.role === 'user' ? 'linear-gradient(135deg,#D85A30,#EF9F27)' : '#0F0E0C',
+            color: m.role === 'user' ? '#fff' : '#F0EBE3',
+            border: m.role === 'user' ? 'none' : '1px solid #2E2820',
+            fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap',
+          }}>
+            {m.content}
+          </div>
+        ))}
+        {loading && <div style={{ fontSize: 12, color: '#7A7268' }}>Thinking…</div>}
+        <div ref={bottomRef} />
+      </div>
+      {chatError && <p style={{ fontSize: 12, color: '#E05252', marginBottom: 10 }}>⚠️ {chatError}</p>}
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && send()}
+          placeholder="Ask a question about the comments..."
+          style={{
+            flex: 1, padding: '10px 14px', borderRadius: 8,
+            border: '1px solid #2E2820', background: '#0F0E0C',
+            color: '#F0EBE3', fontSize: 13, outline: 'none',
+          }}
+        />
+        <button
+          onClick={send}
+          disabled={loading || !input.trim()}
+          style={{
+            padding: '10px 20px', borderRadius: 8, border: 'none',
+            background: input.trim() ? 'linear-gradient(135deg,#D85A30,#EF9F27)' : '#2E2820',
+            color: input.trim() ? '#fff' : '#7A7268', fontWeight: 700, fontSize: 13,
+          }}
+        >
+          Ask
+        </button>
+      </div>
+    </Card>
   )
 }
 
@@ -409,8 +760,22 @@ export default function Analyzer() {
   const [status, setStatus] = useState('idle') // idle | fetching | analyzing | done | error
   const [statusMsg, setStatusMsg] = useState('')
   const [report, setReport] = useState(null)
+  const [comments, setComments] = useState([])
   const [commentCount, setCommentCount] = useState(0)
+  const [videoUrlAnalyzed, setVideoUrlAnalyzed] = useState('')
   const [error, setError] = useState('')
+
+  const [groqKey, setGroqKey] = useState(() => localStorage.getItem(LS_GROQ) || '')
+  const [ytKey, setYtKey] = useState(() => localStorage.getItem(LS_YT) || '')
+  const effectiveGroq = groqKey.trim() || DEFAULT_GROQ_KEY
+  const effectiveYt = ytKey.trim() || DEFAULT_YT_KEY
+
+  function handleSaveKeys(g, y) {
+    setGroqKey(g)
+    setYtKey(y)
+    localStorage.setItem(LS_GROQ, g)
+    localStorage.setItem(LS_YT, y)
+  }
 
   async function handleAnalyze() {
     if (!url.trim()) return
@@ -419,29 +784,43 @@ export default function Analyzer() {
       setError('Could not extract a video ID from that URL. Please paste a valid YouTube link.')
       return
     }
-    if (!GROQ_API_KEY) {
-      setError('Groq API key is missing. Add VITE_GROQ_API_KEY to your .env file.')
+    if (!effectiveGroq) {
+      setError('No Groq API key available. Add your own in API Settings, or set VITE_GROQ_API_KEY.')
+      return
+    }
+    if (!effectiveYt) {
+      setError('No YouTube API key available. Add your own in API Settings, or set VITE_YOUTUBE_API_KEY.')
       return
     }
 
     setError('')
     setReport(null)
+    setComments([])
     try {
       setStatus('fetching')
       setStatusMsg('Fetching comments from YouTube...')
-      const comments = await fetchComments(videoId)
-      if (comments.length === 0) {
+      const fetched = await fetchComments(videoId, effectiveYt, (n) =>
+        setStatusMsg(`Fetching comments from YouTube... (${n} so far)`)
+      )
+      if (fetched.length === 0) {
         setError('No comments found on this video. It may have comments disabled.')
         setStatus('idle')
         return
       }
-      setCommentCount(comments.length)
+      setComments(fetched)
+      setCommentCount(fetched.length)
 
       setStatus('analyzing')
-      setStatusMsg(`Analyzing ${comments.length} comments with AI...`)
-      const result = await analyzeWithGroq(comments)
+      const result = await analyzeAllComments(fetched, effectiveGroq, (p) => {
+        if (p.phase === 'synthesizing') {
+          setStatusMsg(`Synthesizing final report from all ${p.totalComments} comments...`)
+        } else {
+          setStatusMsg(`Analyzing batch ${p.batch} of ${p.totalBatches} (${Math.min(p.batch * BATCH_SIZE, p.totalComments)} of ${p.totalComments} comments)...`)
+        }
+      })
 
       setReport(result)
+      setVideoUrlAnalyzed(url.trim())
       setStatus('done')
     } catch (e) {
       setError(e.message || 'Something went wrong.')
@@ -452,15 +831,56 @@ export default function Analyzer() {
   function handleReset() {
     setUrl('')
     setReport(null)
+    setComments([])
     setStatus('idle')
     setError('')
     setCommentCount(0)
+    setVideoUrlAnalyzed('')
+  }
+
+  function handleDownloadMarkdown() {
+    if (!report) return
+    const md = buildMarkdownReport(report, {
+      commentCount, videoUrl: videoUrlAnalyzed, generatedAt: new Date().toLocaleString(),
+    })
+    downloadFile(`comment-report-${Date.now()}.md`, md, 'text/markdown')
+  }
+
+  function handleDownloadJson() {
+    if (!report) return
+    const payload = {
+      report, commentCount, videoUrl: videoUrlAnalyzed, comments,
+      generatedAt: new Date().toISOString(),
+    }
+    downloadFile(`comment-report-${Date.now()}.json`, JSON.stringify(payload, null, 2), 'application/json')
+  }
+
+  function handleLoadJson(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result)
+        if (!parsed.report) throw new Error('missing report')
+        setReport(parsed.report)
+        setComments(parsed.comments || [])
+        setCommentCount(parsed.commentCount || parsed.comments?.length || 0)
+        setVideoUrlAnalyzed(parsed.videoUrl || '')
+        setStatus('done')
+        setError('')
+      } catch {
+        setError('Could not read that file — is it a report exported from this tool?')
+      }
+    }
+    reader.readAsText(file)
+    e.target.value = ''
   }
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px' }}>
       {/* Page Title */}
-      <div style={{ marginBottom: 36 }}>
+      <div style={{ marginBottom: 24 }}>
         <div style={{
           fontSize: 11, color: '#EF9F27', fontWeight: 700,
           textTransform: 'uppercase', letterSpacing: 1.5, marginBottom: 10,
@@ -471,9 +891,11 @@ export default function Analyzer() {
           What is your audience really saying?
         </h1>
         <p style={{ color: '#7A7268', fontSize: 14, marginTop: 8, lineHeight: 1.7 }}>
-          Paste a YouTube video URL and get a full intelligence report on your comment section in seconds.
+          Paste a YouTube video URL and get a full intelligence report on your comment section.
         </p>
       </div>
+
+      <SettingsPanel groqKey={groqKey} ytKey={ytKey} onSave={handleSaveKeys} />
 
       {/* Input */}
       {status !== 'done' && (
@@ -523,8 +945,17 @@ export default function Analyzer() {
             </p>
           )}
           <p style={{ fontSize: 11, color: '#3A3328', marginTop: 10 }}>
-            Works with any public YouTube video · Analyzes up to 300 comments
+            Works with any public YouTube video · Fetches up to {MAX_COMMENTS} comments and analyzes all of them in batches of {BATCH_SIZE}
           </p>
+
+          {status === 'idle' && (
+            <div style={{ marginTop: 16, borderTop: '1px solid #2E2820', paddingTop: 16 }}>
+              <label style={{ fontSize: 12, color: '#7A7268', cursor: 'pointer' }}>
+                📂 Load a previously downloaded report (.json)
+                <input type="file" accept="application/json" onChange={handleLoadJson} style={{ display: 'none' }} />
+              </label>
+            </div>
+          )}
         </div>
       )}
 
@@ -536,7 +967,23 @@ export default function Analyzer() {
       {/* Report */}
       {status === 'done' && report && (
         <>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 20 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 20 }}>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button onClick={handleDownloadMarkdown} style={{
+                padding: '8px 18px', borderRadius: 8,
+                border: '1px solid #2E2820', background: '#242018',
+                color: '#F0EBE3', fontSize: 13, fontWeight: 600,
+              }}>
+                ⬇ Download Report (.md)
+              </button>
+              <button onClick={handleDownloadJson} style={{
+                padding: '8px 18px', borderRadius: 8,
+                border: '1px solid #2E2820', background: '#242018',
+                color: '#F0EBE3', fontSize: 13, fontWeight: 600,
+              }}>
+                ⬇ Download Data (.json)
+              </button>
+            </div>
             <button onClick={handleReset} style={{
               padding: '8px 18px', borderRadius: 8,
               border: '1px solid #2E2820', background: 'transparent',
@@ -546,6 +993,9 @@ export default function Analyzer() {
             </button>
           </div>
           <Report data={report} commentCount={commentCount} />
+          <div style={{ marginTop: 20 }}>
+            <ChatBot comments={comments} report={report} apiKey={effectiveGroq} videoUrl={videoUrlAnalyzed} />
+          </div>
         </>
       )}
     </div>
