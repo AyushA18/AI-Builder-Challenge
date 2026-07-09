@@ -465,12 +465,12 @@ function SettingsPanel({ groqKey, onSave }) {
       {open && (
         <Card style={{ marginTop: 12 }}>
           <p style={{ fontSize: 12, color: '#7A7268', marginBottom: 16, lineHeight: 1.6 }}>
-            Optional — bring your own Groq API key instead of the shared demo key. It's saved only in
-            your browser and sent straight to Groq, never through our servers. Leave blank to keep
-            using the default. (YouTube comment fetching always uses this project's own key.)
+            Optional — bring your own API key instead of the shared demo key. It's saved only in
+            your browser and sent straight to the API provider, never through our servers. Leave blank
+            to keep using the default. (YouTube comment fetching always uses this project's own key.)
           </p>
-          <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your Groq API key</label>
-          <input type="password" value={g} onChange={e => setG(e.target.value)} placeholder="gsk_..." style={inputStyle} />
+          <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your API key</label>
+          <input type="password" value={g} onChange={e => setG(e.target.value)} placeholder="Enter your API key..." style={inputStyle} />
           <div style={{ display: 'flex', gap: 10 }}>
             <button
               onClick={() => { onSave(g.trim()); setOpen(false) }}
@@ -559,7 +559,7 @@ ${commentCorpus}`
   return (
     <Card>
       <SectionTitle icon="🤖" title="Ask Questions About These Comments" />
-      <div style={{ maxHeight: 320, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
+      <div style={{ maxHeight: 520, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
         {messages.length === 0 && (
           <p style={{ fontSize: 13, color: '#7A7268' }}>
             Try: "What do people want in the next video?" or "Are there recurring complaints?"
@@ -886,7 +886,7 @@ export default function Analyzer() {
   }
 
   return (
-    <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px' }}>
+    <div style={{ maxWidth: 1400, margin: '0 auto', padding: '40px 20px' }}>
       {/* Page Title */}
       <div style={{ marginBottom: 24 }}>
         <div style={{
@@ -984,9 +984,15 @@ export default function Analyzer() {
               ← Analyze Another Video
             </button>
           </div>
-          <Report data={report} commentCount={commentCount} />
-          <div style={{ marginTop: 20 }}>
-            <ChatBot comments={comments} report={report} apiKey={effectiveGroq} videoUrl={videoUrlAnalyzed} />
+          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start' }}>
+            {/* Left column — report */}
+            <div style={{ flex: '1 1 0', minWidth: 0 }}>
+              <Report data={report} commentCount={commentCount} />
+            </div>
+            {/* Right column — chatbot */}
+            <div style={{ width: 360, flexShrink: 0, position: 'sticky', top: 24 }}>
+              <ChatBot comments={comments} report={report} apiKey={effectiveGroq} videoUrl={videoUrlAnalyzed} />
+            </div>
           </div>
         </>
       )}
