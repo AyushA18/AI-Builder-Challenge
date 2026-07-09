@@ -10,8 +10,8 @@ const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
 const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
-const BATCH_SIZE = 60          // comments per Groq call during the "map" step
 const MAX_COMMENTS = 1500      // safety cap so one video can't fetch forever / blow quota
+const ANALYZE_SAMPLE = 50      // max comments sent to Groq for analysis — keeps us under TPM limits
 const LS_GROQ = 'pixelforge_groq_key'
 
 // ─── HELPERS: YOUTUBE ────────────────────────────────────────────────────────
@@ -234,26 +234,25 @@ Return ONLY valid JSON, no markdown, no explanation:
 (topQuestions: up to 5, painPoints: up to 3, contentIdeas: up to 5, audiencePhrases: up to 8, nextVideoIdeas: up to 3.)`
 }
 
-// Runs the full map-reduce pipeline over every fetched comment, 60 at a time.
+// Randomly sample up to ANALYZE_SAMPLE comments, favouring shorter ones so we
+// stay well under the free-tier TPM ceiling for a single Groq call.
+function sampleAnalysisComments(comments) {
+  if (comments.length <= ANALYZE_SAMPLE) return comments
+  // Fisher-Yates shuffle on a copy, then take the first ANALYZE_SAMPLE.
+  const pool = [...comments]
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]]
+  }
+  return pool.slice(0, ANALYZE_SAMPLE)
+}
+
+// Analyzes a random sample of 50 comments in a single Groq call.
 async function analyzeAllComments(comments, apiKey, onProgress) {
-  const chunks = []
-  for (let i = 0; i < comments.length; i += BATCH_SIZE) {
-    chunks.push(comments.slice(i, i + BATCH_SIZE))
-  }
+  const sample = sampleAnalysisComments(comments)
 
-  // 2-second inter-batch gap keeps rolling TPM well under the 12 000/min free-tier ceiling.
-  const INTER_BATCH_DELAY_MS = 2000
-
-  let combined = null
-  for (let i = 0; i < chunks.length; i++) {
-    onProgress?.({ phase: 'batch', batch: i + 1, totalBatches: chunks.length, totalComments: comments.length })
-    const result = await analyzeChunk(chunks[i], apiKey)
-    combined = combined ? mergeBatchResults(combined, result) : result
-    // Pace requests — skip delay after the last batch.
-    if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, INTER_BATCH_DELAY_MS))
-    }
-  }
+  onProgress?.({ phase: 'batch', batch: 1, totalBatches: 1, totalComments: sample.length })
+  const combined = await analyzeChunk(sample, apiKey)
 
   const totalCounted =
     combined.sentimentCounts.positive + combined.sentimentCounts.neutral + combined.sentimentCounts.negative || 1
@@ -263,7 +262,7 @@ async function analyzeAllComments(comments, apiKey, onProgress) {
     negative: Math.round((combined.sentimentCounts.negative / totalCounted) * 100),
   }
 
-  onProgress?.({ phase: 'synthesizing', totalComments: comments.length })
+  onProgress?.({ phase: 'synthesizing', totalComments: sample.length })
   const topComment = combined.topComment || { author: 'unknown', text: '', likes: 0 }
   const final = await callGroq(apiKey, [{
     role: 'user',
@@ -274,7 +273,7 @@ async function analyzeAllComments(comments, apiKey, onProgress) {
       candidatePhrases: dedupe(combined.phrases).slice(0, 40),
       topComment,
       sentiment,
-      totalComments: comments.length,
+      totalComments: sample.length,
     }),
   }], 2000)
 
@@ -925,9 +924,9 @@ export default function Analyzer() {
       setStatus('analyzing')
       const result = await analyzeAllComments(fetched, effectiveGroq, (p) => {
         if (p.phase === 'synthesizing') {
-          setStatusMsg(`Synthesizing final report from all ${p.totalComments} comments...`)
+          setStatusMsg(`Synthesizing report from ${p.totalComments} comments...`)
         } else {
-          setStatusMsg(`Analyzing batch ${p.batch} of ${p.totalBatches} (${Math.min(p.batch * BATCH_SIZE, p.totalComments)} of ${p.totalComments} comments)...`)
+          setStatusMsg(`Analyzing ${p.totalComments} sampled comments...`)
         }
       })
 
