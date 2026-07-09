@@ -523,6 +523,37 @@ function SettingsPanel({ groqKey, onSave }) {
 }
 
 // ─── CHATBOT ─────────────────────────────────────────────────────────────────
+// Pick at most 50 representative comments to keep the chat system prompt
+// well under the 12 000 TPM free-tier ceiling.
+//
+// Selection rules (in priority order):
+//  1. Always include the top-10 most-liked comments (high signal).
+//  2. From the remaining pool, drop comments whose text exceeds 120 chars
+//     AND have fewer than 2 likes (low-value long comments).
+//  3. Randomly sample from what's left until we reach 50 total.
+//  4. Each comment text is hard-capped at 120 chars in the corpus string.
+function sampleChatComments(comments, max = 50) {
+  if (comments.length <= max) return comments
+
+  // Sort by likes descending so top comments are always first.
+  const sorted = [...comments].sort((a, b) => (b.likes || 0) - (a.likes || 0))
+
+  const top = sorted.slice(0, 10)
+  const rest = sorted.slice(10)
+
+  // Filter out long low-engagement comments from the candidate pool.
+  const candidates = rest.filter(c => c.text.length <= 120 || (c.likes || 0) >= 2)
+
+  // Random shuffle the candidates then take what we still need.
+  const needed = max - top.length
+  for (let i = candidates.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]]
+  }
+
+  return [...top, ...candidates.slice(0, needed)]
+}
+
 function ChatBot({ comments, report, apiKey, videoUrl }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -542,12 +573,12 @@ function ChatBot({ comments, report, apiKey, videoUrl }) {
     setInput('')
     setLoading(true)
     try {
-      const sample = comments.slice(0, 400)
+      const sample = sampleChatComments(comments, 50)
       const commentCorpus = sample
-        .map(c => `@${c.author} (👍${c.likes}): ${c.text.slice(0, 180)}`)
+        .map(c => `@${c.author} (👍${c.likes}): ${c.text.slice(0, 120)}`)
         .join('\n')
 
-      const systemPrompt = `You are a helpful assistant answering questions about the comment section of a YouTube video (${videoUrl}). You have an analysis report and a sample of ${sample.length} of the ${comments.length} total comments below. Answer the user's question directly and concisely, referencing specific commenters where useful. If the comments don't cover something, say so honestly rather than guessing.
+      const systemPrompt = `You are a helpful assistant answering questions about the comment section of a YouTube video (${videoUrl}). You have an analysis report and a sample of ${sample.length} representative comments (selected from ${comments.length} total) below. Answer the user's question directly and concisely, referencing specific commenters where useful. If the comments don't cover something, say so honestly rather than guessing.
 
 ANALYSIS REPORT SUMMARY:
 ${JSON.stringify({ sentiment: report.sentiment, topQuestions: report.topQuestions, painPoints: report.painPoints, contentIdeas: report.contentIdeas })}
@@ -555,11 +586,13 @@ ${JSON.stringify({ sentiment: report.sentiment, topQuestions: report.topQuestion
 COMMENTS SAMPLE:
 ${commentCorpus}`
 
-      const data = await callGroq(apiKey, [
-        { role: 'system', content: systemPrompt },
-        ...newMessages,
-      ], 800).catch(async () => {
-        // callGroq expects JSON content; chat replies are plain text, so call the API directly here
+      // Chat replies are plain text (not JSON), so we call the API directly
+      // with the same retry-on-429 logic used by callGroq.
+      const MAX_RETRIES = 6
+      let attempt = 0
+      let reply = null
+
+      while (reply === null) {
         const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
@@ -567,18 +600,26 @@ ${commentCorpus}`
             model: GROQ_MODEL,
             messages: [{ role: 'system', content: systemPrompt }, ...newMessages],
             temperature: 0.4,
-            max_tokens: 800,
+            max_tokens: 600,
           }),
         })
+
         if (!res.ok) {
           const err = await res.json().catch(() => ({}))
-          throw new Error(err.error?.message || 'Chat request failed')
+          const msg = err.error?.message || 'Chat request failed'
+          if (res.status === 429 && attempt < MAX_RETRIES) {
+            attempt++
+            const waitMs = (parseRetryAfterMs(msg) ?? 2000 * attempt) + 500
+            await new Promise(r => setTimeout(r, waitMs))
+            continue
+          }
+          throw new Error(msg)
         }
-        const json = await res.json()
-        return { __rawReply: json.choices[0].message.content.trim() }
-      })
 
-      const reply = data.__rawReply
+        const json = await res.json()
+        reply = json.choices[0].message.content.trim()
+      }
+
       setMessages(m => [...m, { role: 'assistant', content: reply }])
     } catch (e) {
       setMessages(m => [...m, { role: 'assistant', content: `⚠️ ${e.message}` }])
