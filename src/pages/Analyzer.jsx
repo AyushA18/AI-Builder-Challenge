@@ -62,31 +62,55 @@ async function fetchComments(videoId, ytKey, onProgress) {
 }
 
 // ─── HELPERS: GROQ ───────────────────────────────────────────────────────────
+// Parse the "Please try again in X.XXs" wait time Groq includes in 429 messages.
+function parseRetryAfterMs(message = '') {
+  const m = message.match(/try again in ([0-9.]+)s/i)
+  return m ? Math.ceil(parseFloat(m[1]) * 1000) : null
+}
+
 async function callGroq(apiKey, messages, maxTokens = 2000) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages,
-      temperature: 0.3,
-      max_tokens: maxTokens,
-    }),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    const msg = err.error?.message || `Groq API error (${res.status})`
-    const e = new Error(msg)
-    e.status = res.status
-    throw e
+  const MAX_RETRIES = 6
+  let attempt = 0
+
+  while (true) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages,
+        temperature: 0.3,
+        max_tokens: maxTokens,
+      }),
+    })
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      const msg = err.error?.message || `Groq API error (${res.status})`
+
+      // Only retry on rate-limit (429); throw everything else immediately.
+      if (res.status === 429 && attempt < MAX_RETRIES) {
+        attempt++
+        // Use the wait time Groq tells us, plus a 500 ms safety buffer.
+        const groqWaitMs = parseRetryAfterMs(msg)
+        const waitMs = groqWaitMs ? groqWaitMs + 500 : 2000 * attempt
+        await new Promise(r => setTimeout(r, waitMs))
+        continue
+      }
+
+      const e = new Error(msg)
+      e.status = res.status
+      throw e
+    }
+
+    const data = await res.json()
+    const raw = data.choices[0].message.content.trim()
+    const clean = raw.replace(/```json|```/g, '').trim()
+    return JSON.parse(clean)
   }
-  const data = await res.json()
-  const raw = data.choices[0].message.content.trim()
-  const clean = raw.replace(/```json|```/g, '').trim()
-  return JSON.parse(clean)
 }
 
 function dedupe(arr) {
@@ -217,11 +241,18 @@ async function analyzeAllComments(comments, apiKey, onProgress) {
     chunks.push(comments.slice(i, i + BATCH_SIZE))
   }
 
+  // 2-second inter-batch gap keeps rolling TPM well under the 12 000/min free-tier ceiling.
+  const INTER_BATCH_DELAY_MS = 2000
+
   let combined = null
   for (let i = 0; i < chunks.length; i++) {
     onProgress?.({ phase: 'batch', batch: i + 1, totalBatches: chunks.length, totalComments: comments.length })
     const result = await analyzeChunk(chunks[i], apiKey)
     combined = combined ? mergeBatchResults(combined, result) : result
+    // Pace requests — skip delay after the last batch.
+    if (i < chunks.length - 1) {
+      await new Promise(r => setTimeout(r, INTER_BATCH_DELAY_MS))
+    }
   }
 
   const totalCounted =
