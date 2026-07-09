@@ -10,8 +10,7 @@ const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
 const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
-const MAX_COMMENTS = 1500       // safety cap so one video can't fetch forever / blow quota
-const ANALYZE_SAMPLE = 50       // comments randomly sampled and sent to Groq — keeps us under TPM limits
+const MAX_COMMENTS = 50         // fetch only the 50 most relevant comments — no more, no less
 const LS_GROQ = 'pixelforge_groq_key'
 
 // ─── HELPERS: YOUTUBE ────────────────────────────────────────────────────────
@@ -29,36 +28,25 @@ function extractVideoId(url) {
   return null
 }
 
-// Fetches every available top-level comment (paginating through the YouTube API)
-// instead of stopping after the first page or two.
+// Fetches the first 50 most-relevant comments in a single YouTube API call.
 async function fetchComments(videoId, ytKey, onProgress) {
-  let comments = []
-  let pageToken = ''
-
-  while (comments.length < MAX_COMMENTS) {
-    const url = `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=100&order=relevance${pageToken}&key=${ytKey}`
-    const res = await fetch(url)
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error?.message || 'Failed to fetch comments')
-    }
-    const data = await res.json()
-    for (const item of data.items || []) {
-      const s = item.snippet.topLevelComment.snippet
-      comments.push({
-        author: s.authorDisplayName,
-        text: s.textDisplay.replace(/<[^>]*>/g, ''),
-        likes: s.likeCount,
-      })
-    }
-    onProgress?.(comments.length)
-    if (data.nextPageToken) {
-      pageToken = `&pageToken=${data.nextPageToken}`
-    } else {
-      break
-    }
+  const url = `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=${MAX_COMMENTS}&order=relevance&key=${ytKey}`
+  const res = await fetch(url)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error?.message || 'Failed to fetch comments')
   }
-  return comments.slice(0, MAX_COMMENTS)
+  const data = await res.json()
+  const comments = (data.items || []).map(item => {
+    const s = item.snippet.topLevelComment.snippet
+    return {
+      author: s.authorDisplayName,
+      text: s.textDisplay.replace(/<[^>]*>/g, ''),
+      likes: s.likeCount,
+    }
+  })
+  onProgress?.(comments.length)
+  return comments
 }
 
 // ─── HELPERS: GROQ ───────────────────────────────────────────────────────────
@@ -126,133 +114,56 @@ function dedupe(arr) {
   return out
 }
 
-function dedupeToxic(arr) {
-  const seen = new Set()
-  const out = []
-  for (const item of arr || []) {
-    const key = `${item.author}|${item.text}`.toLowerCase()
-    if (!seen.has(key)) {
-      seen.add(key)
-      out.push(item)
-    }
-  }
-  return out
-}
-
-// Build the single extraction prompt for all 50 sampled comments.
-function buildExtractPrompt(comments) {
+// Single prompt: analyze 50 comments and produce the full final report in one call.
+function buildAnalysisPrompt(comments) {
   const commentText = comments
-    .map((c, i) => `[${i + 1}] @${c.author} (👍 ${c.likes}): ${c.text.slice(0, 200)}`)
+    .map((c, i) => `[${i + 1}] @${c.author} (👍${c.likes}): ${c.text.slice(0, 100)}`)
     .join('\n')
 
-  return `You are analyzing ${comments.length} YouTube comments. Extract raw signal from them.
+  return `Analyze these ${comments.length} YouTube comments and produce a complete report.
 
 COMMENTS:
 ${commentText}
 
 Return ONLY valid JSON, no markdown, no explanation:
 {
-  "sentimentCounts": {"positive": <number>, "neutral": <number>, "negative": <number>},
-  "questions": ["<distinct question seen in comments>"],
-  "painPoints": ["<pain point or complaint mentioned>"],
-  "contentIdeas": ["<content idea implied by comments>"],
-  "phrases": ["<notable recurring phrase or slang>"],
-  "topComment": {"author": "<username>", "text": "<comment text>", "likes": <number>},
-  "toxicComments": [{"author": "<username>", "text": "<comment>", "reason": "<why it's toxic>"}]
-}
-(Arrays can be empty. Include at most 5 items per array except toxicComments.)`
-}
-
-// Sends all sampled comments to Groq in a single call.
-async function analyzeChunk(comments, apiKey) {
-  return await callGroq(apiKey, [{ role: 'user', content: buildExtractPrompt(comments) }], 1200)
-}
-
-// "Reduce" step: turn the aggregated candidates into the final polished report.
-function buildFinalSynthesisPrompt({ candidateQuestions, candidatePainPoints, candidateIdeas, candidatePhrases, topComment, sentiment, totalComments }) {
-  return `You analyzed ${totalComments} YouTube comments in batches and extracted these raw candidate signals across all of them. Now synthesize the FINAL polished report — merge duplicates/near-duplicates and keep only the strongest, most representative items.
-
-CANDIDATE QUESTIONS SEEN:
-${candidateQuestions.map(q => `- ${q}`).join('\n') || '(none)'}
-
-CANDIDATE PAIN POINTS:
-${candidatePainPoints.map(p => `- ${p}`).join('\n') || '(none)'}
-
-CANDIDATE CONTENT IDEAS:
-${candidateIdeas.map(c => `- ${c}`).join('\n') || '(none)'}
-
-CANDIDATE RECURRING PHRASES:
-${candidatePhrases.map(p => `- ${p}`).join('\n') || '(none)'}
-
-SENTIMENT BREAKDOWN (computed precisely from all ${totalComments} comments): ${sentiment.positive}% positive, ${sentiment.neutral}% neutral, ${sentiment.negative}% negative
-
-MOST-LIKED COMMENT: @${topComment.author} (👍 ${topComment.likes}): "${topComment.text}"
-
-Return ONLY valid JSON, no markdown, no explanation:
-{
-  "sentimentSummary": "<one sentence overall vibe consistent with the breakdown above>",
+  "sentimentSummary": "<one sentence overall vibe>",
+  "sentiment": {"positive": <0-100>, "neutral": <0-100>, "negative": <0-100>},
   "topQuestions": [{"question": "...", "frequency": "..."}],
   "painPoints": [{"point": "...", "mentions": "..."}],
   "contentIdeas": [{"idea": "...", "basis": "..."}],
-  "audiencePhrases": ["...", "..."],
+  "audiencePhrases": ["..."],
   "nextVideoIdeas": [{"title": "...", "reason": "..."}],
-  "whyTopCommentResonated": "<one sentence explaining why the most-liked comment above resonated>"
+  "topComment": {"author": "...", "text": "...", "likes": <number>, "whyItResonated": "..."},
+  "toxicComments": [{"author": "...", "text": "...", "reason": "..."}]
 }
-(topQuestions: up to 5, painPoints: up to 3, contentIdeas: up to 5, audiencePhrases: up to 8, nextVideoIdeas: up to 3.)`
-}
-
-// Randomly sample up to ANALYZE_SAMPLE comments, favouring shorter ones so we
-// stay well under the free-tier TPM ceiling for a single Groq call.
-function sampleAnalysisComments(comments) {
-  if (comments.length <= ANALYZE_SAMPLE) return comments
-  // Fisher-Yates shuffle on a copy, then take the first ANALYZE_SAMPLE.
-  const pool = [...comments]
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]]
-  }
-  return pool.slice(0, ANALYZE_SAMPLE)
+(topQuestions: up to 5, painPoints: up to 3, contentIdeas: up to 5, audiencePhrases: up to 6, nextVideoIdeas: up to 3, toxicComments: up to 5. Sentiment must sum to 100.)`
 }
 
-// Analyzes a random sample of 50 comments in a single Groq call.
+// One Groq call — analyze all 50 comments and return the final report.
 async function analyzeAllComments(comments, apiKey, onProgress) {
-  const sample = sampleAnalysisComments(comments)
-
-  onProgress?.({ phase: 'batch', batch: 1, totalBatches: 1, totalComments: sample.length })
-  const combined = await analyzeChunk(sample, apiKey)
-
-  const totalCounted =
-    combined.sentimentCounts.positive + combined.sentimentCounts.neutral + combined.sentimentCounts.negative || 1
-  const sentiment = {
-    positive: Math.round((combined.sentimentCounts.positive / totalCounted) * 100),
-    neutral: Math.round((combined.sentimentCounts.neutral / totalCounted) * 100),
-    negative: Math.round((combined.sentimentCounts.negative / totalCounted) * 100),
-  }
-
-  onProgress?.({ phase: 'synthesizing', totalComments: sample.length })
-  const topComment = combined.topComment || { author: 'unknown', text: '', likes: 0 }
-  const final = await callGroq(apiKey, [{
-    role: 'user',
-    content: buildFinalSynthesisPrompt({
-      candidateQuestions: dedupe(combined.questions).slice(0, 40),
-      candidatePainPoints: dedupe(combined.painPoints).slice(0, 40),
-      candidateIdeas: dedupe(combined.contentIdeas).slice(0, 40),
-      candidatePhrases: dedupe(combined.phrases).slice(0, 40),
-      topComment,
-      sentiment,
-      totalComments: sample.length,
-    }),
-  }], 2000)
+  onProgress?.({ phase: 'analyzing', totalComments: comments.length })
+  const result = await callGroq(apiKey, [{ role: 'user', content: buildAnalysisPrompt(comments) }], 1500)
 
   return {
-    sentiment: { ...sentiment, summary: final.sentimentSummary },
-    topQuestions: final.topQuestions,
-    painPoints: final.painPoints,
-    contentIdeas: final.contentIdeas,
-    audiencePhrases: final.audiencePhrases,
-    nextVideoIdeas: final.nextVideoIdeas,
-    topComment: { ...topComment, whyItResonated: final.whyTopCommentResonated },
-    toxicComments: dedupeToxic(combined.toxicComments).slice(0, 10),
+    sentiment: {
+      positive: result.sentiment?.positive ?? 0,
+      neutral:  result.sentiment?.neutral  ?? 0,
+      negative: result.sentiment?.negative ?? 0,
+      summary:  result.sentimentSummary    ?? '',
+    },
+    topQuestions:    result.topQuestions    ?? [],
+    painPoints:      result.painPoints      ?? [],
+    contentIdeas:    result.contentIdeas    ?? [],
+    audiencePhrases: result.audiencePhrases ?? [],
+    nextVideoIdeas:  result.nextVideoIdeas  ?? [],
+    topComment: {
+      author:         result.topComment?.author        ?? 'unknown',
+      text:           result.topComment?.text          ?? '',
+      likes:          result.topComment?.likes         ?? 0,
+      whyItResonated: result.topComment?.whyItResonated ?? '',
+    },
+    toxicComments: result.toxicComments ?? [],
   }
 }
 
@@ -419,7 +330,7 @@ function LoadingPulse({ message }) {
         🔥
       </div>
       <p style={{ color: '#EF9F27', fontWeight: 600, fontSize: 16 }}>{message}</p>
-      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>Analyzing a random sample of {ANALYZE_SAMPLE} comments…</p>
+      <p style={{ color: '#7A7268', fontSize: 13, marginTop: 8 }}>Analyzing {MAX_COMMENTS} comments…</p>
       <style>{`@keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }`}</style>
     </div>
   )
@@ -890,11 +801,7 @@ export default function Analyzer() {
 
       setStatus('analyzing')
       const result = await analyzeAllComments(fetched, effectiveGroq, (p) => {
-        if (p.phase === 'synthesizing') {
-          setStatusMsg(`Synthesizing report from ${p.totalComments} comments...`)
-        } else {
-          setStatusMsg(`Analyzing ${p.totalComments} sampled comments...`)
-        }
+        setStatusMsg(`Analyzing ${p.totalComments} comments...`)
       })
 
       setReport(result)
@@ -991,7 +898,7 @@ export default function Analyzer() {
             </p>
           )}
           <p style={{ fontSize: 11, color: '#3A3328', marginTop: 10 }}>
-            Works with any public YouTube video · Randomly samples {ANALYZE_SAMPLE} comments for analysis
+            Works with any public YouTube video · Analyzes the top {MAX_COMMENTS} most relevant comments
           </p>
         </div>
       )}
