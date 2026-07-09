@@ -1,17 +1,18 @@
 import { useState, useRef, useEffect } from 'react'
+import { jsPDF } from 'jspdf'
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-// 👇 These are used as the DEFAULT keys. Users can override them with their own
-// keys in the Settings panel — theirs are stored only in their browser (localStorage)
-// and used instead of these whenever present.
+// 👇 The Groq key is the DEFAULT key. Users can override it with their own key
+// in the Settings panel — theirs is stored only in their browser (localStorage)
+// and used instead of this whenever present.
+// The YouTube key is NOT user-overridable — it always uses this project's key.
 const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
-const DEFAULT_YT_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
+const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
 const BATCH_SIZE = 60          // comments per Groq call during the "map" step
 const MAX_COMMENTS = 1500      // safety cap so one video can't fetch forever / blow quota
 const LS_GROQ = 'pixelforge_groq_key'
-const LS_YT = 'pixelforge_yt_key'
 
 // ─── HELPERS: YOUTUBE ────────────────────────────────────────────────────────
 function extractVideoId(url) {
@@ -258,52 +259,98 @@ async function analyzeAllComments(comments, apiKey, onProgress) {
   }
 }
 
-// ─── HELPERS: FILE DOWNLOAD / LOAD ──────────────────────────────────────────
-function downloadFile(filename, content, mime = 'text/plain') {
-  const blob = new Blob([content], { type: mime })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
-}
+// ─── HELPERS: PDF DOWNLOAD ───────────────────────────────────────────────────
+function downloadPdfReport(report, meta) {
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' })
+  const pageWidth = doc.internal.pageSize.getWidth()
+  const pageHeight = doc.internal.pageSize.getHeight()
+  const margin = 48
+  const maxWidth = pageWidth - margin * 2
+  let y = 56
 
-function buildMarkdownReport(report, meta) {
-  const lines = []
-  lines.push(`# Comment Intelligence Report`, '')
-  lines.push(`**Video:** ${meta.videoUrl}`)
-  lines.push(`**Comments analyzed:** ${meta.commentCount}`)
-  lines.push(`**Generated:** ${meta.generatedAt}`, '')
-  lines.push(`## Overall Sentiment`, report.sentiment.summary, '')
-  lines.push(`- Positive: ${report.sentiment.positive}%`)
-  lines.push(`- Neutral: ${report.sentiment.neutral}%`)
-  lines.push(`- Negative: ${report.sentiment.negative}%`, '')
-  lines.push(`## Most Resonant Comment`)
-  lines.push(`@${report.topComment.author} (👍 ${report.topComment.likes})`)
-  lines.push(`> ${report.topComment.text}`, '')
-  lines.push(`**Why it resonated:** ${report.topComment.whyItResonated}`, '')
-  lines.push(`## Top Questions`)
-  report.topQuestions.forEach((q, i) => lines.push(`${i + 1}. ${q.question} _(${q.frequency})_`))
-  lines.push('')
-  lines.push(`## Pain Points`)
-  report.painPoints.forEach(p => lines.push(`- ${p.point} (${p.mentions})`))
-  lines.push('')
-  lines.push(`## Content Ideas`)
-  report.contentIdeas.forEach((c, i) => lines.push(`${i + 1}. ${c.idea}\n   - From: ${c.basis}`))
-  lines.push('')
-  lines.push(`## Suggested Next Videos`)
-  report.nextVideoIdeas.forEach((v, i) => lines.push(`${i + 1}. **${v.title}** — ${v.reason}`))
-  lines.push('')
-  lines.push(`## Audience Phrases`)
-  lines.push(report.audiencePhrases.map(p => `\`${p}\``).join(', '), '')
-  if (report.toxicComments?.length) {
-    lines.push(`## Flagged Comments`)
-    report.toxicComments.forEach(t => lines.push(`- @${t.author}: "${t.text}" — _${t.reason}_`))
+  function checkPageBreak(need = 16) {
+    if (y + need > pageHeight - margin) {
+      doc.addPage()
+      y = 56
+    }
   }
-  return lines.join('\n')
+  function addTitle(text) {
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(18)
+    doc.setTextColor(20, 20, 20)
+    doc.text(text, margin, y)
+    y += 26
+  }
+  function addMeta(text) {
+    doc.setFont('helvetica', 'normal')
+    doc.setFontSize(10)
+    doc.setTextColor(110, 110, 110)
+    doc.text(text, margin, y)
+    y += 14
+  }
+  function addHeading(text) {
+    y += 8
+    checkPageBreak(28)
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(13)
+    doc.setTextColor(216, 90, 48)
+    doc.text(text, margin, y)
+    y += 18
+  }
+  function addBody(text, { bold = false, indent = 0 } = {}) {
+    doc.setFont('helvetica', bold ? 'bold' : 'normal')
+    doc.setFontSize(11)
+    doc.setTextColor(40, 40, 40)
+    const lines = doc.splitTextToSize(text, maxWidth - indent)
+    for (const line of lines) {
+      checkPageBreak(16)
+      doc.text(line, margin + indent, y)
+      y += 15
+    }
+    y += 4
+  }
+
+  addTitle('Comment Intelligence Report')
+  addMeta(`Video: ${meta.videoUrl}`)
+  addMeta(`Comments analyzed: ${meta.commentCount}`)
+  addMeta(`Generated: ${meta.generatedAt}`)
+
+  addHeading('Overall Sentiment')
+  addBody(report.sentiment.summary)
+  addBody(`Positive: ${report.sentiment.positive}%   Neutral: ${report.sentiment.neutral}%   Negative: ${report.sentiment.negative}%`)
+
+  addHeading('Most Resonant Comment')
+  addBody(`@${report.topComment.author} (${report.topComment.likes} likes)`, { bold: true })
+  addBody(`"${report.topComment.text}"`)
+  addBody(`Why it resonated: ${report.topComment.whyItResonated}`)
+
+  addHeading('Top Questions')
+  report.topQuestions.forEach((q, i) => addBody(`${i + 1}. ${q.question}  (${q.frequency})`))
+
+  addHeading('Pain Points')
+  report.painPoints.forEach(p => addBody(`- ${p.point}  (${p.mentions})`))
+
+  addHeading('Content Ideas')
+  report.contentIdeas.forEach((c, i) => {
+    addBody(`${i + 1}. ${c.idea}`, { bold: true })
+    addBody(`From: ${c.basis}`, { indent: 14 })
+  })
+
+  addHeading('Suggested Next Videos')
+  report.nextVideoIdeas.forEach((v, i) => {
+    addBody(`${i + 1}. ${v.title}`, { bold: true })
+    addBody(v.reason, { indent: 14 })
+  })
+
+  addHeading('Audience Phrases')
+  addBody(report.audiencePhrases.join(', '))
+
+  if (report.toxicComments?.length) {
+    addHeading('Flagged Comments')
+    report.toxicComments.forEach(t => addBody(`@${t.author}: "${t.text}" — ${t.reason}`))
+  }
+
+  doc.save(`comment-report-${Date.now()}.pdf`)
 }
 
 // ─── SUB COMPONENTS ──────────────────────────────────────────────────────────
@@ -382,13 +429,12 @@ function LoadingPulse({ message }) {
 }
 
 // ─── SETTINGS (BRING-YOUR-OWN API KEY) ──────────────────────────────────────
-function SettingsPanel({ groqKey, ytKey, onSave }) {
+function SettingsPanel({ groqKey, onSave }) {
   const [open, setOpen] = useState(false)
   const [g, setG] = useState(groqKey)
-  const [y, setY] = useState(ytKey)
   const usingOwnGroq = !!groqKey.trim()
 
-  useEffect(() => { setG(groqKey); setY(ytKey) }, [groqKey, ytKey])
+  useEffect(() => { setG(groqKey) }, [groqKey])
 
   const inputStyle = {
     width: '100%', padding: '10px 14px', borderRadius: 8,
@@ -419,23 +465,21 @@ function SettingsPanel({ groqKey, ytKey, onSave }) {
       {open && (
         <Card style={{ marginTop: 12 }}>
           <p style={{ fontSize: 12, color: '#7A7268', marginBottom: 16, lineHeight: 1.6 }}>
-            Optional — bring your own API keys instead of the shared demo keys. They're saved only in
-            your browser and sent straight to Groq / YouTube, never through our servers. Leave blank to
-            keep using the default.
+            Optional — bring your own Groq API key instead of the shared demo key. It's saved only in
+            your browser and sent straight to Groq, never through our servers. Leave blank to keep
+            using the default. (YouTube comment fetching always uses this project's own key.)
           </p>
           <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your Groq API key</label>
           <input type="password" value={g} onChange={e => setG(e.target.value)} placeholder="gsk_..." style={inputStyle} />
-          <label style={{ fontSize: 12, fontWeight: 600, color: '#F0EBE3' }}>Your YouTube Data API key</label>
-          <input type="password" value={y} onChange={e => setY(e.target.value)} placeholder="AIza..." style={inputStyle} />
           <div style={{ display: 'flex', gap: 10 }}>
             <button
-              onClick={() => { onSave(g.trim(), y.trim()); setOpen(false) }}
+              onClick={() => { onSave(g.trim()); setOpen(false) }}
               style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg,#D85A30,#EF9F27)', color: '#fff', fontWeight: 700, fontSize: 13 }}
             >
               Save
             </button>
             <button
-              onClick={() => { setG(''); setY(''); onSave('', '') }}
+              onClick={() => { setG(''); onSave('') }}
               style={{ padding: '10px 20px', borderRadius: 8, border: '1px solid #2E2820', background: 'transparent', color: '#7A7268', fontWeight: 600, fontSize: 13 }}
             >
               Clear / use default
@@ -766,15 +810,11 @@ export default function Analyzer() {
   const [error, setError] = useState('')
 
   const [groqKey, setGroqKey] = useState(() => localStorage.getItem(LS_GROQ) || '')
-  const [ytKey, setYtKey] = useState(() => localStorage.getItem(LS_YT) || '')
   const effectiveGroq = groqKey.trim() || DEFAULT_GROQ_KEY
-  const effectiveYt = ytKey.trim() || DEFAULT_YT_KEY
 
-  function handleSaveKeys(g, y) {
+  function handleSaveKeys(g) {
     setGroqKey(g)
-    setYtKey(y)
     localStorage.setItem(LS_GROQ, g)
-    localStorage.setItem(LS_YT, y)
   }
 
   async function handleAnalyze() {
@@ -788,8 +828,8 @@ export default function Analyzer() {
       setError('No Groq API key available. Add your own in API Settings, or set VITE_GROQ_API_KEY.')
       return
     }
-    if (!effectiveYt) {
-      setError('No YouTube API key available. Add your own in API Settings, or set VITE_YOUTUBE_API_KEY.')
+    if (!YOUTUBE_API_KEY) {
+      setError('YouTube API key is missing. Set VITE_YOUTUBE_API_KEY in your .env file.')
       return
     }
 
@@ -799,7 +839,7 @@ export default function Analyzer() {
     try {
       setStatus('fetching')
       setStatusMsg('Fetching comments from YouTube...')
-      const fetched = await fetchComments(videoId, effectiveYt, (n) =>
+      const fetched = await fetchComments(videoId, YOUTUBE_API_KEY, (n) =>
         setStatusMsg(`Fetching comments from YouTube... (${n} so far)`)
       )
       if (fetched.length === 0) {
@@ -838,43 +878,11 @@ export default function Analyzer() {
     setVideoUrlAnalyzed('')
   }
 
-  function handleDownloadMarkdown() {
+  function handleDownloadPdf() {
     if (!report) return
-    const md = buildMarkdownReport(report, {
+    downloadPdfReport(report, {
       commentCount, videoUrl: videoUrlAnalyzed, generatedAt: new Date().toLocaleString(),
     })
-    downloadFile(`comment-report-${Date.now()}.md`, md, 'text/markdown')
-  }
-
-  function handleDownloadJson() {
-    if (!report) return
-    const payload = {
-      report, commentCount, videoUrl: videoUrlAnalyzed, comments,
-      generatedAt: new Date().toISOString(),
-    }
-    downloadFile(`comment-report-${Date.now()}.json`, JSON.stringify(payload, null, 2), 'application/json')
-  }
-
-  function handleLoadJson(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(reader.result)
-        if (!parsed.report) throw new Error('missing report')
-        setReport(parsed.report)
-        setComments(parsed.comments || [])
-        setCommentCount(parsed.commentCount || parsed.comments?.length || 0)
-        setVideoUrlAnalyzed(parsed.videoUrl || '')
-        setStatus('done')
-        setError('')
-      } catch {
-        setError('Could not read that file — is it a report exported from this tool?')
-      }
-    }
-    reader.readAsText(file)
-    e.target.value = ''
   }
 
   return (
@@ -895,7 +903,7 @@ export default function Analyzer() {
         </p>
       </div>
 
-      <SettingsPanel groqKey={groqKey} ytKey={ytKey} onSave={handleSaveKeys} />
+      <SettingsPanel groqKey={groqKey} onSave={handleSaveKeys} />
 
       {/* Input */}
       {status !== 'done' && (
@@ -947,15 +955,6 @@ export default function Analyzer() {
           <p style={{ fontSize: 11, color: '#3A3328', marginTop: 10 }}>
             Works with any public YouTube video · Fetches up to {MAX_COMMENTS} comments and analyzes all of them in batches of {BATCH_SIZE}
           </p>
-
-          {status === 'idle' && (
-            <div style={{ marginTop: 16, borderTop: '1px solid #2E2820', paddingTop: 16 }}>
-              <label style={{ fontSize: 12, color: '#7A7268', cursor: 'pointer' }}>
-                📂 Load a previously downloaded report (.json)
-                <input type="file" accept="application/json" onChange={handleLoadJson} style={{ display: 'none' }} />
-              </label>
-            </div>
-          )}
         </div>
       )}
 
@@ -969,19 +968,12 @@ export default function Analyzer() {
         <>
           <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 20 }}>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <button onClick={handleDownloadMarkdown} style={{
+              <button onClick={handleDownloadPdf} style={{
                 padding: '8px 18px', borderRadius: 8,
                 border: '1px solid #2E2820', background: '#242018',
                 color: '#F0EBE3', fontSize: 13, fontWeight: 600,
               }}>
-                ⬇ Download Report (.md)
-              </button>
-              <button onClick={handleDownloadJson} style={{
-                padding: '8px 18px', borderRadius: 8,
-                border: '1px solid #2E2820', background: '#242018',
-                color: '#F0EBE3', fontSize: 13, fontWeight: 600,
-              }}>
-                ⬇ Download Data (.json)
+                ⬇ Download Report (.pdf)
               </button>
             </div>
             <button onClick={handleReset} style={{
