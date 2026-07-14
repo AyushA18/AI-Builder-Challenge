@@ -639,19 +639,35 @@ export default function Instagram() {
     }
 
     if (code) {
+      // Guard against this exact code ever being exchanged twice — e.g. a
+      // duplicate page load, a StrictMode double-invoke, or a race where the
+      // user navigates back to a stale URL still holding an old ?code=.
+      // Instagram authorization codes are single-use, so a second exchange
+      // attempt with the same code always fails with a confusing
+      // "redirect_uri" error even though the redirect_uri was correct.
+      const alreadyHandled = sessionStorage.getItem('pixelforge_ig_code_used')
+      if (alreadyHandled === code) {
+        window.history.replaceState({}, '', '/instagram')
+        return
+      }
+      sessionStorage.setItem('pixelforge_ig_code_used', code)
+
+      // Strip the code from the URL immediately, synchronously — before the
+      // network request even starts — so no possible re-render or re-mount
+      // can read this same ?code= param again.
+      window.history.replaceState({}, '', '/instagram')
+
       setConnection('connecting')
       exchangeCodeForToken(code)
         .then(({ accessToken: token }) => {
           sessionStorage.setItem(SS_IG_TOKEN, token)
           setAccessToken(token)
           setConnection('connected')
-          window.history.replaceState({}, '', '/instagram')
           return loadPosts(token)
         })
         .catch(e => {
           setConnectError(e.message || 'Failed to connect Instagram account')
           setConnection('idle')
-          window.history.replaceState({}, '', '/instagram')
         })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
