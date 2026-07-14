@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import Home from './pages/Home'
 import Analyzer from './pages/Analyzer'
+import Instagram from './pages/Instagram'
 import './index.css'
 
 function Navbar() {
@@ -30,6 +31,7 @@ function Navbar() {
       <div style={{ display: 'flex', gap: 28 }}>
         <Link to="/" style={linkStyle('/')}>Home</Link>
         <Link to="/analyzer" style={linkStyle('/analyzer')}>Comment Analyzer</Link>
+        <Link to="/instagram" style={linkStyle('/instagram')}>Instagram</Link>
       </div>
     </nav>
   )
@@ -42,6 +44,7 @@ function App() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/analyzer" element={<Analyzer />} />
+        <Route path="/instagram" element={<Instagram />} />
       </Routes>
     </BrowserRouter>
   )
