@@ -54,7 +54,13 @@ export const handler = async (event) => {
 
   try {
     // ── Step 1: exchange the authorization code for a short-lived token ──
-    const form = new URLSearchParams()
+    // IMPORTANT: Instagram's oauth/access_token endpoint expects
+    // multipart/form-data, NOT application/x-www-form-urlencoded.
+    // Using URLSearchParams here sends the wrong content type and can
+    // produce misleading errors (including a bogus "redirect_uri" complaint
+    // even when the redirect_uri is correct). FormData makes fetch set the
+    // correct multipart Content-Type with boundary automatically.
+    const form = new FormData()
     form.append('client_id', appId)
     form.append('client_secret', appSecret)
     form.append('grant_type', 'authorization_code')
