@@ -1,4 +1,4 @@
-// netlify/functions/instagram-token.js
+// api/instagram-token.js
 //
 // Exchanges an Instagram OAuth "authorization code" for a long-lived (60-day)
 // access token. This MUST run server-side because it needs INSTAGRAM_APP_SECRET,
@@ -11,37 +11,40 @@
 //   4. This function exchanges code -> short-lived token -> long-lived token
 //   5. Returns { accessToken, expiresIn, userId } to the frontend
 //
-// Required Netlify environment variables (server-side, NOT VITE_-prefixed):
+// Required Vercel environment variables (server-side, NOT VITE_-prefixed):
 //   INSTAGRAM_APP_ID
 //   INSTAGRAM_APP_SECRET
+//
+// Deployed URL on Vercel: /api/instagram-token
 
-export const handler = async (event) => {
-  const jsonHeaders = { 'Content-Type': 'application/json' }
-
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers: jsonHeaders, body: JSON.stringify({ error: 'Method not allowed' }) }
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  let payload
-  try {
-    payload = JSON.parse(event.body || '{}')
-  } catch {
-    return { statusCode: 400, headers: jsonHeaders, body: JSON.stringify({ error: 'Invalid JSON body' }) }
+  let payload = req.body
+  // Vercel usually parses JSON bodies automatically, but guard in case
+  // it arrives as a raw string.
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload || '{}')
+    } catch {
+      return res.status(400).json({ error: 'Invalid JSON body' })
+    }
   }
+  payload = payload || {}
 
   const { code, redirectUri } = payload
   if (!code || !redirectUri) {
-    return { statusCode: 400, headers: jsonHeaders, body: JSON.stringify({ error: 'Missing code or redirectUri' }) }
+    return res.status(400).json({ error: 'Missing code or redirectUri' })
   }
 
   const appId = process.env.INSTAGRAM_APP_ID
   const appSecret = process.env.INSTAGRAM_APP_SECRET
   if (!appId || !appSecret) {
-    return {
-      statusCode: 500,
-      headers: jsonHeaders,
-      body: JSON.stringify({ error: 'Server is missing INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET env vars' }),
-    }
+    return res.status(500).json({
+      error: 'Server is missing INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET env vars',
+    })
   }
 
   // ── TEMPORARY DEBUG LOGGING — remove once the flow works ──
@@ -78,7 +81,7 @@ export const handler = async (event) => {
 
     if (!shortRes.ok || !shortData.access_token) {
       const msg = shortData.error_message || shortData.error_description || 'Failed to exchange authorization code'
-      return { statusCode: 400, headers: jsonHeaders, body: JSON.stringify({ error: msg }) }
+      return res.status(400).json({ error: msg })
     }
 
     const { access_token: shortLivedToken, user_id: userId } = shortData
@@ -90,19 +93,15 @@ export const handler = async (event) => {
 
     if (!longRes.ok || !longData.access_token) {
       const msg = longData.error?.message || 'Failed to obtain long-lived token'
-      return { statusCode: 400, headers: jsonHeaders, body: JSON.stringify({ error: msg }) }
+      return res.status(400).json({ error: msg })
     }
 
-    return {
-      statusCode: 200,
-      headers: jsonHeaders,
-      body: JSON.stringify({
-        accessToken: longData.access_token,
-        expiresIn: longData.expires_in, // seconds, ~5184000 (60 days)
-        userId,
-      }),
-    }
+    return res.status(200).json({
+      accessToken: longData.access_token,
+      expiresIn: longData.expires_in, // seconds, ~5184000 (60 days)
+      userId,
+    })
   } catch (err) {
-    return { statusCode: 500, headers: jsonHeaders, body: JSON.stringify({ error: err.message || 'Unexpected server error' }) }
+    return res.status(500).json({ error: err.message || 'Unexpected server error' })
   }
 }
