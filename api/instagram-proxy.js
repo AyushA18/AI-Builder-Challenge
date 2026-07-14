@@ -43,10 +43,21 @@ export default async function handler(req, res) {
 
     const params = new URLSearchParams(normalizedRest)
     params.set('access_token', accessToken)
-    const url = `https://graph.instagram.com/${safePath}?${params.toString()}`
+    // Pin an explicit API version — the unversioned endpoint can silently
+    // fall back to an older default version, which has been inconsistent
+    // for the comments edge on Reels media specifically.
+    const url = `https://graph.instagram.com/v23.0/${safePath}?${params.toString()}`
 
     const upstreamRes = await fetch(url)
     const data = await upstreamRes.json()
+
+    // ── TEMPORARY DEBUG LOGGING — remove once comments-on-reels is fixed ──
+    // Never logs the access token. Logs the path + full upstream body so we
+    // can see exactly what Instagram returned (empty data vs. an error
+    // object vs. a permissions issue) — check this in Vercel's function logs.
+    console.log('[instagram-proxy] path:', safePath)
+    console.log('[instagram-proxy] upstream status:', upstreamRes.status)
+    console.log('[instagram-proxy] upstream body:', JSON.stringify(data))
 
     if (!upstreamRes.ok) {
       console.log('[instagram-proxy] upstream error:', upstreamRes.status, JSON.stringify(data))

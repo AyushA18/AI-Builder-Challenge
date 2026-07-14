@@ -37,7 +37,7 @@ async function exchangeCodeForToken(code) {
 }
 
 // ─── HELPERS: INSTAGRAM GRAPH API ────────────────────────────────────────────
-const MEDIA_FIELDS = 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count'
+const MEDIA_FIELDS = 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count'
 
 async function fetchRecentMedia(accessToken) {
   const params = new URLSearchParams({ path: 'me/media', accessToken, fields: MEDIA_FIELDS, limit: '12' })
@@ -54,6 +54,12 @@ async function fetchPostComments(mediaId, accessToken) {
   const params = new URLSearchParams({ path: `${mediaId}/comments`, accessToken, fields, limit: String(MAX_COMMENTS) })
   const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
+
+  // ── TEMPORARY DEBUG LOGGING — remove once comments-on-reels is fixed ──
+  console.log('[fetchPostComments] mediaId:', mediaId)
+  console.log('[fetchPostComments] response status ok:', res.ok, res.status)
+  console.log('[fetchPostComments] raw response:', data)
+
   if (!res.ok) {
     throw new Error(data.error?.message || data.error || 'Failed to fetch comments for this post')
   }
@@ -707,6 +713,8 @@ export default function Instagram() {
     setError('')
     setReport(null)
     setComments([])
+    // ── TEMPORARY DEBUG LOGGING — remove once comments-on-reels is fixed ──
+    console.log('[handleSelectPost] full post object:', post)
     try {
       setStatus('fetching')
       setStatusMsg('Fetching comments from Instagram...')
