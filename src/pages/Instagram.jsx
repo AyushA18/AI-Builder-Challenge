@@ -26,7 +26,7 @@ function buildAuthUrl() {
 }
 
 async function exchangeCodeForToken(code) {
-  const res = await fetch('/.netlify/functions/instagram-token', {
+  const res = await fetch('/api/instagram-token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code, redirectUri: REDIRECT_URI }),
@@ -41,7 +41,7 @@ const MEDIA_FIELDS = 'id,caption,media_type,media_url,thumbnail_url,permalink,ti
 
 async function fetchRecentMedia(accessToken) {
   const params = new URLSearchParams({ path: 'me/media', accessToken, fields: MEDIA_FIELDS, limit: '12' })
-  const res = await fetch(`/.netlify/functions/instagram-proxy?${params.toString()}`)
+  const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error?.message || data.error || 'Failed to fetch your recent posts')
@@ -52,7 +52,7 @@ async function fetchRecentMedia(accessToken) {
 async function fetchPostComments(mediaId, accessToken) {
   const fields = 'text,username,timestamp,like_count'
   const params = new URLSearchParams({ path: `${mediaId}/comments`, accessToken, fields, limit: String(MAX_COMMENTS) })
-  const res = await fetch(`/.netlify/functions/instagram-proxy?${params.toString()}`)
+  const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error?.message || data.error || 'Failed to fetch comments for this post')
