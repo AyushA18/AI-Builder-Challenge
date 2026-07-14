@@ -16,6 +16,7 @@ const SS_IG_TOKEN = 'pixelforge_ig_token'      // sessionStorage — cleared whe
 // ─── HELPERS: INSTAGRAM OAUTH ────────────────────────────────────────────────
 function buildAuthUrl() {
   const params = new URLSearchParams({
+    force_reauth: 'true',
     client_id: IG_APP_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
