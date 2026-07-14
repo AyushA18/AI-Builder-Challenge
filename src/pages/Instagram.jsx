@@ -16,7 +16,7 @@ const SS_IG_TOKEN = 'pixelforge_ig_token'      // sessionStorage — cleared whe
 // ─── HELPERS: INSTAGRAM OAUTH ────────────────────────────────────────────────
 function buildAuthUrl() {
   const params = new URLSearchParams({
-    force_reauth: 'true',
+    force_reauth: 'true', // always show the full login screen — matches Meta's own Embed URL
     client_id: IG_APP_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
@@ -40,25 +40,23 @@ async function exchangeCodeForToken(code) {
 const MEDIA_FIELDS = 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count'
 
 async function fetchRecentMedia(accessToken) {
-  const url = `https://graph.instagram.com/me/media?fields=${MEDIA_FIELDS}&limit=12&access_token=${encodeURIComponent(accessToken)}`
-  const res = await fetch(url)
+  const params = new URLSearchParams({ path: 'me/media', accessToken, fields: MEDIA_FIELDS, limit: '12' })
+  const res = await fetch(`/.netlify/functions/instagram-proxy?${params.toString()}`)
+  const data = await res.json().catch(() => ({}))
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.error?.message || 'Failed to fetch your recent posts')
+    throw new Error(data.error?.message || data.error || 'Failed to fetch your recent posts')
   }
-  const data = await res.json()
   return data.data || []
 }
 
 async function fetchPostComments(mediaId, accessToken) {
   const fields = 'text,username,timestamp,like_count'
-  const url = `https://graph.instagram.com/${mediaId}/comments?fields=${fields}&limit=${MAX_COMMENTS}&access_token=${encodeURIComponent(accessToken)}`
-  const res = await fetch(url)
+  const params = new URLSearchParams({ path: `${mediaId}/comments`, accessToken, fields, limit: String(MAX_COMMENTS) })
+  const res = await fetch(`/.netlify/functions/instagram-proxy?${params.toString()}`)
+  const data = await res.json().catch(() => ({}))
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.error?.message || 'Failed to fetch comments for this post')
+    throw new Error(data.error?.message || data.error || 'Failed to fetch comments for this post')
   }
-  const data = await res.json()
   return (data.data || []).map(c => ({
     author: c.username || 'unknown',
     text: c.text || '',
