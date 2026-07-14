@@ -44,6 +44,14 @@ export const handler = async (event) => {
     }
   }
 
+  // ── TEMPORARY DEBUG LOGGING — remove once the flow works ──
+  // Safe to leave client_id visible; NEVER logs the secret itself, only its length,
+  // which is enough to catch a common copy-paste mistake (extra whitespace/newline).
+  console.log('[instagram-token] received redirectUri:', redirectUri)
+  console.log('[instagram-token] received code (first 12 chars):', code.slice(0, 12) + '...')
+  console.log('[instagram-token] using INSTAGRAM_APP_ID:', appId)
+  console.log('[instagram-token] INSTAGRAM_APP_SECRET length:', appSecret.length, '(trimmed:', appSecret.trim().length, ')')
+
   try {
     // ── Step 1: exchange the authorization code for a short-lived token ──
     const form = new URLSearchParams()
@@ -58,6 +66,9 @@ export const handler = async (event) => {
       body: form,
     })
     const shortData = await shortRes.json()
+
+    console.log('[instagram-token] Meta short-lived token response status:', shortRes.status)
+    console.log('[instagram-token] Meta short-lived token response body:', JSON.stringify(shortData))
 
     if (!shortRes.ok || !shortData.access_token) {
       const msg = shortData.error_message || shortData.error_description || 'Failed to exchange authorization code'
