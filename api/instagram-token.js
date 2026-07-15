@@ -1,21 +1,33 @@
 // api/instagram-token.js
 //
-// Exchanges an Instagram OAuth "authorization code" for a long-lived (60-day)
-// access token. This MUST run server-side because it needs INSTAGRAM_APP_SECRET,
-// which should never be exposed to the browser.
+// FACEBOOK LOGIN FOR BUSINESS FLOW (replaces the old Instagram-Login flow).
+// Reels comments are not reliably readable through graph.instagram.com
+// (Instagram API with Instagram Login). This flow uses graph.facebook.com
+// instead, via a Facebook Page linked to the Instagram Business account,
+// which has mature support for reading Reels comments.
 //
 // Flow:
-//   1. Frontend redirects the user to https://www.instagram.com/oauth/authorize
-//   2. Instagram redirects back to {VITE_APP_URL}/instagram?code=...
+//   1. Frontend redirects the user to https://www.facebook.com/v23.0/dialog/oauth
+//   2. Facebook redirects back to {VITE_APP_URL}/instagram?code=...
 //   3. Frontend calls this function with { code, redirectUri }
-//   4. This function exchanges code -> short-lived token -> long-lived token
-//   5. Returns { accessToken, expiresIn, userId } to the frontend
+//   4. This function:
+//        a. exchanges code -> short-lived user token
+//        b. exchanges short-lived -> long-lived user token (~60 days)
+//        c. looks up the user's Facebook Pages and finds the one with a
+//           linked Instagram Business Account
+//        d. returns that Page's access token (page tokens derived from a
+//           long-lived user token do not expire) plus the IG business
+//           account id/username
+//   5. Returns { accessToken, igUserId, username, profilePictureUrl } to the frontend
 //
 // Required Vercel environment variables (server-side, NOT VITE_-prefixed):
-//   INSTAGRAM_APP_ID
-//   INSTAGRAM_APP_SECRET
+//   INSTAGRAM_APP_ID       — your Meta App ID (same app, with "Facebook Login
+//                             for Business" product added)
+//   INSTAGRAM_APP_SECRET   — your Meta App Secret
 //
 // Deployed URL on Vercel: /api/instagram-token
+
+const GRAPH_VERSION = 'v23.0'
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -23,8 +35,6 @@ export default async function handler(req, res) {
   }
 
   let payload = req.body
-  // Vercel usually parses JSON bodies automatically, but guard in case
-  // it arrives as a raw string.
   if (typeof payload === 'string') {
     try {
       payload = JSON.parse(payload || '{}')
@@ -47,48 +57,35 @@ export default async function handler(req, res) {
     })
   }
 
-  // ── TEMPORARY DEBUG LOGGING — remove once the flow works ──
-  // Safe to leave client_id visible; NEVER logs the secret itself, only its length,
-  // which is enough to catch a common copy-paste mistake (extra whitespace/newline).
   console.log('[instagram-token] received redirectUri:', redirectUri)
   console.log('[instagram-token] received code (first 12 chars):', code.slice(0, 12) + '...')
-  console.log('[instagram-token] using INSTAGRAM_APP_ID:', appId)
-  console.log('[instagram-token] INSTAGRAM_APP_SECRET length:', appSecret.length, '(trimmed:', appSecret.trim().length, ')')
 
   try {
-    // ── Step 1: exchange the authorization code for a short-lived token ──
-    // IMPORTANT: Instagram's oauth/access_token endpoint expects
-    // multipart/form-data, NOT application/x-www-form-urlencoded.
-    // Using URLSearchParams here sends the wrong content type and can
-    // produce misleading errors (including a bogus "redirect_uri" complaint
-    // even when the redirect_uri is correct). FormData makes fetch set the
-    // correct multipart Content-Type with boundary automatically.
-    const form = new FormData()
-    form.append('client_id', appId)
-    form.append('client_secret', appSecret)
-    form.append('grant_type', 'authorization_code')
-    form.append('redirect_uri', redirectUri)
-    form.append('code', code)
-
-    const shortRes = await fetch('https://api.instagram.com/oauth/access_token', {
-      method: 'POST',
-      body: form,
+    // ── Step 1: exchange the authorization code for a short-lived user token ──
+    const shortParams = new URLSearchParams({
+      client_id: appId,
+      client_secret: appSecret,
+      redirect_uri: redirectUri,
+      code,
     })
+    const shortRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?${shortParams.toString()}`)
     const shortData = await shortRes.json()
 
-    console.log('[instagram-token] Meta short-lived token response status:', shortRes.status)
-    console.log('[instagram-token] Meta short-lived token response body:', JSON.stringify(shortData))
+    console.log('[instagram-token] short-lived token response status:', shortRes.status)
 
     if (!shortRes.ok || !shortData.access_token) {
-      const msg = shortData.error_message || shortData.error_description || 'Failed to exchange authorization code'
+      const msg = shortData.error?.message || 'Failed to exchange authorization code'
       return res.status(400).json({ error: msg })
     }
 
-    const { access_token: shortLivedToken, user_id: userId } = shortData
-
-    // ── Step 2: exchange the short-lived token for a long-lived token (60 days) ──
-    const longUrl = `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${encodeURIComponent(appSecret)}&access_token=${encodeURIComponent(shortLivedToken)}`
-    const longRes = await fetch(longUrl)
+    // ── Step 2: exchange for a long-lived user token (~60 days) ──
+    const longParams = new URLSearchParams({
+      grant_type: 'fb_exchange_token',
+      client_id: appId,
+      client_secret: appSecret,
+      fb_exchange_token: shortData.access_token,
+    })
+    const longRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token?${longParams.toString()}`)
     const longData = await longRes.json()
 
     if (!longRes.ok || !longData.access_token) {
@@ -96,10 +93,38 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: msg })
     }
 
+    const longLivedUserToken = longData.access_token
+
+    // ── Step 3: find the user's Pages, and the one with a linked IG Business Account ──
+    const pagesParams = new URLSearchParams({
+      fields: 'name,access_token,instagram_business_account{id,username,profile_picture_url}',
+      access_token: longLivedUserToken,
+    })
+    const pagesRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/me/accounts?${pagesParams.toString()}`)
+    const pagesData = await pagesRes.json()
+
+    console.log('[instagram-token] pages response:', JSON.stringify(pagesData))
+
+    if (!pagesRes.ok) {
+      const msg = pagesData.error?.message || 'Failed to fetch linked Facebook Pages'
+      return res.status(400).json({ error: msg })
+    }
+
+    const pageWithIg = (pagesData.data || []).find(p => p.instagram_business_account)
+
+    if (!pageWithIg) {
+      return res.status(400).json({
+        error: 'No Facebook Page with a linked Instagram Business account was found. Make sure your Instagram account is linked to a Facebook Page you manage.',
+      })
+    }
+
+    const ig = pageWithIg.instagram_business_account
+
     return res.status(200).json({
-      accessToken: longData.access_token,
-      expiresIn: longData.expires_in, // seconds, ~5184000 (60 days)
-      userId,
+      accessToken: pageWithIg.access_token, // Page access token — long-lived, doesn't expire on its own
+      igUserId: ig.id,
+      username: ig.username,
+      profilePictureUrl: ig.profile_picture_url,
     })
   } catch (err) {
     return res.status(500).json({ error: err.message || 'Unexpected server error' })

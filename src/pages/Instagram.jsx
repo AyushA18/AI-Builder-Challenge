@@ -7,22 +7,27 @@ const IG_APP_ID = import.meta.env.VITE_INSTAGRAM_APP_ID
 const APP_URL = (import.meta.env.VITE_APP_URL || window.location.origin).replace(/\/$/, '')
 const REDIRECT_URI = `${APP_URL}/instagram`
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
-const IG_SCOPES = 'instagram_business_basic,instagram_business_manage_comments'
+// Facebook Login for Business scopes — replaces the old Instagram Login scopes.
+// pages_show_list / pages_read_engagement let us find the Page + linked IG account;
+// instagram_basic / instagram_manage_comments let us read media and comments.
+const IG_SCOPES = 'pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_comments'
+const FB_OAUTH_VERSION = 'v23.0'
 
 const MAX_COMMENTS = 50
 const LS_GROQ = 'pixelforge_groq_key'          // shared with Analyzer.jsx — same key
 const SS_IG_TOKEN = 'pixelforge_ig_token'      // sessionStorage — cleared when tab closes
+const SS_IG_USER_ID = 'pixelforge_ig_user_id'  // the Instagram Business Account id
+const SS_IG_PROFILE = 'pixelforge_ig_profile'  // cached { username, profile_picture_url }
 
-// ─── HELPERS: INSTAGRAM OAUTH ────────────────────────────────────────────────
+// ─── HELPERS: FACEBOOK OAUTH (for Instagram Business access) ────────────────
 function buildAuthUrl() {
   const params = new URLSearchParams({
-    force_reauth: 'true', // always show the full login screen — matches Meta's own Embed URL
     client_id: IG_APP_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
     scope: IG_SCOPES,
   })
-  return `https://www.instagram.com/oauth/authorize?${params.toString()}`
+  return `https://www.facebook.com/${FB_OAUTH_VERSION}/dialog/oauth?${params.toString()}`
 }
 
 async function exchangeCodeForToken(code) {
@@ -33,14 +38,14 @@ async function exchangeCodeForToken(code) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(data.error || 'Failed to connect Instagram account')
-  return data // { accessToken, expiresIn, userId }
+  return data // { accessToken, igUserId, username, profilePictureUrl }
 }
 
 // ─── HELPERS: INSTAGRAM GRAPH API ────────────────────────────────────────────
 const MEDIA_FIELDS = 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count'
 
-async function fetchRecentMedia(accessToken) {
-  const params = new URLSearchParams({ path: 'me/media', accessToken, fields: MEDIA_FIELDS, limit: '12' })
+async function fetchRecentMedia(igUserId, accessToken) {
+  const params = new URLSearchParams({ path: `${igUserId}/media`, accessToken, fields: MEDIA_FIELDS, limit: '12' })
   const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -342,11 +347,23 @@ function ConnectScreen({ onConnect, connecting, error }) {
 }
 
 // ─── POST GRID ────────────────────────────────────────────────────────────────
-function PostGrid({ posts, onSelect, onDisconnect }) {
+function PostGrid({ posts, profile, onSelect, onDisconnect }) {
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-        <h2 style={{ fontSize: 18, fontWeight: 800, color: '#F0EBE3' }}>Pick a post to analyze</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h2 style={{ fontSize: 18, fontWeight: 800, color: '#F0EBE3' }}>Pick a post to analyze</h2>
+          {profile?.username && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+              {profile.profile_picture_url && (
+                <img src={profile.profile_picture_url} alt="" style={{ width: 22, height: 22, borderRadius: 999, objectFit: 'cover' }} />
+              )}
+              <span style={{ fontSize: 13, color: '#7A7268' }}>
+                Connected as <span style={{ color: '#EF9F27', fontWeight: 600 }}>@{profile.username}</span>
+              </span>
+            </div>
+          )}
+        </div>
         <button onClick={onDisconnect} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #2E2820', background: 'transparent', color: '#7A7268', fontSize: 13, fontWeight: 600 }}>
           Disconnect
         </button>
@@ -603,8 +620,10 @@ export default function Instagram() {
   const [connection, setConnection] = useState('idle') // idle | connecting | connected | error
   const [connectError, setConnectError] = useState('')
   const [accessToken, setAccessToken] = useState('')
+  const [igUserId, setIgUserId] = useState('')
   const [posts, setPosts] = useState([])
   const [postsLoading, setPostsLoading] = useState(false)
+  const [profile, setProfile] = useState(null)
 
   const [selectedPost, setSelectedPost] = useState(null)
   const [status, setStatus] = useState('idle') // idle | fetching | analyzing | done | error
@@ -624,11 +643,17 @@ export default function Instagram() {
 
   // ── On mount: resume an existing session, or handle the OAuth redirect ──
   useEffect(() => {
-    const existing = sessionStorage.getItem(SS_IG_TOKEN)
-    if (existing) {
-      setAccessToken(existing)
+    const existingToken = sessionStorage.getItem(SS_IG_TOKEN)
+    const existingUserId = sessionStorage.getItem(SS_IG_USER_ID)
+    if (existingToken && existingUserId) {
+      const cachedProfile = sessionStorage.getItem(SS_IG_PROFILE)
+      setAccessToken(existingToken)
+      setIgUserId(existingUserId)
+      if (cachedProfile) {
+        try { setProfile(JSON.parse(cachedProfile)) } catch { /* ignore */ }
+      }
       setConnection('connected')
-      loadPosts(existing)
+      loadPosts(existingUserId, existingToken)
       return
     }
 
@@ -647,7 +672,7 @@ export default function Instagram() {
       // Guard against this exact code ever being exchanged twice — e.g. a
       // duplicate page load, a StrictMode double-invoke, or a race where the
       // user navigates back to a stale URL still holding an old ?code=.
-      // Instagram authorization codes are single-use, so a second exchange
+      // Facebook authorization codes are single-use, so a second exchange
       // attempt with the same code always fails with a confusing
       // "redirect_uri" error even though the redirect_uri was correct.
       const alreadyHandled = sessionStorage.getItem('pixelforge_ig_code_used')
@@ -664,11 +689,16 @@ export default function Instagram() {
 
       setConnection('connecting')
       exchangeCodeForToken(code)
-        .then(({ accessToken: token }) => {
+        .then(({ accessToken: token, igUserId: userId, username, profilePictureUrl }) => {
           sessionStorage.setItem(SS_IG_TOKEN, token)
+          sessionStorage.setItem(SS_IG_USER_ID, userId)
+          const prof = { username, profile_picture_url: profilePictureUrl }
+          sessionStorage.setItem(SS_IG_PROFILE, JSON.stringify(prof))
           setAccessToken(token)
+          setIgUserId(userId)
+          setProfile(prof)
           setConnection('connected')
-          return loadPosts(token)
+          return loadPosts(userId, token)
         })
         .catch(e => {
           setConnectError(e.message || 'Failed to connect Instagram account')
@@ -678,10 +708,10 @@ export default function Instagram() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  async function loadPosts(token) {
+  async function loadPosts(userId, token) {
     setPostsLoading(true)
     try {
-      const media = await fetchRecentMedia(token)
+      const media = await fetchRecentMedia(userId, token)
       setPosts(media)
     } catch (e) {
       setConnectError(e.message || 'Failed to load posts')
@@ -698,9 +728,13 @@ export default function Instagram() {
 
   function handleDisconnect() {
     sessionStorage.removeItem(SS_IG_TOKEN)
+    sessionStorage.removeItem(SS_IG_USER_ID)
+    sessionStorage.removeItem(SS_IG_PROFILE)
     setAccessToken('')
+    setIgUserId('')
     setConnection('idle')
     setPosts([])
+    setProfile(null)
     handleReset()
   }
 
@@ -776,7 +810,7 @@ export default function Instagram() {
       {connection === 'connected' && status === 'idle' && !report && (
         postsLoading
           ? <LoadingPulse message="Loading your recent posts..." />
-          : <Card><PostGrid posts={posts} onSelect={handleSelectPost} onDisconnect={handleDisconnect} /></Card>
+          : <Card><PostGrid posts={posts} profile={profile} onSelect={handleSelectPost} onDisconnect={handleDisconnect} /></Card>
       )}
 
       {error && status !== 'fetching' && status !== 'analyzing' && (
