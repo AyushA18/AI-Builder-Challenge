@@ -1,22 +1,22 @@
 // api/instagram-proxy.js
 //
-// graph.instagram.com does not send CORS headers permissive enough for
-// direct browser fetch() calls — requests made straight from the frontend
-// fail with a generic, unhelpful "NetworkError when attempting to fetch
-// resource" (Firefox) or a similarly opaque failure in Chrome.
-//
-// This function proxies GET requests to graph.instagram.com server-side,
-// where CORS doesn't apply, and returns the JSON straight through.
+// FACEBOOK LOGIN FOR BUSINESS FLOW: proxies GET requests to graph.facebook.com
+// server-side (where CORS doesn't apply) using a Page access token tied to
+// a Facebook Page with a linked Instagram Business Account. This has more
+// reliable support for reading Reels comments than the old
+// graph.instagram.com (Instagram Login) flow did.
 //
 // Usage from the frontend:
-//   /api/instagram-proxy?path=me/media&accessToken=...&fields=...&limit=12
+//   /api/instagram-proxy?path={ig-user-id}/media&accessToken=...&fields=...&limit=12
 //   /api/instagram-proxy?path={media-id}/comments&accessToken=...&fields=...&limit=50
 //
 // Query params:
-//   path         - required. The graph.instagram.com path after the domain,
-//                  e.g. "me/media" or "17895695668004550/comments"
-//   accessToken  - required. The long-lived Instagram access token.
-//   (anything else) - forwarded as-is to graph.instagram.com (fields, limit, etc.)
+//   path         - required. The graph.facebook.com path after the version,
+//                  e.g. "17841405309211844/media" or "17895695668004550/comments"
+//   accessToken  - required. The Page access token returned by /api/instagram-token.
+//   (anything else) - forwarded as-is to graph.facebook.com (fields, limit, etc.)
+
+const GRAPH_VERSION = 'v23.0'
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -43,10 +43,7 @@ export default async function handler(req, res) {
 
     const params = new URLSearchParams(normalizedRest)
     params.set('access_token', accessToken)
-    // Pin an explicit API version — the unversioned endpoint can silently
-    // fall back to an older default version, which has been inconsistent
-    // for the comments edge on Reels media specifically.
-    const url = `https://graph.instagram.com/v23.0/${safePath}?${params.toString()}`
+    const url = `https://graph.facebook.com/${GRAPH_VERSION}/${safePath}?${params.toString()}`
 
     const upstreamRes = await fetch(url)
     const data = await upstreamRes.json()
