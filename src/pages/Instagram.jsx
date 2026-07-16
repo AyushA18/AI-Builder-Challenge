@@ -346,6 +346,16 @@ function SettingsPanel({ groqKey, onSave }) {
 
 // ─── CONNECT SCREEN ──────────────────────────────────────────────────────────
 function ConnectScreen({ onConnect, connecting, error }) {
+  function handleSwitchAccount() {
+    // Instagram's OAuth dialog has no prompt=login / reauth parameter (confirmed
+    // against Meta's own oauth/authorize reference docs), so we can't force a
+    // credentials prompt programmatically. This opens Instagram's logout page
+    // in a new tab so the user can log out manually, then come back and click
+    // Connect — at which point Instagram's dialog will require login again
+    // since there's no active session.
+    window.open('https://www.instagram.com/accounts/logout/', '_blank', 'noopener,noreferrer')
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', padding: '60px 20px' }}>
       <div style={{ fontSize: 52, marginBottom: 20 }}>📷</div>
@@ -366,6 +376,15 @@ function ConnectScreen({ onConnect, connecting, error }) {
         }}
       >
         {connecting ? 'Connecting…' : 'Connect with Instagram →'}
+      </button>
+      <button
+        onClick={handleSwitchAccount}
+        style={{
+          marginTop: 14, background: 'none', border: 'none', cursor: 'pointer',
+          color: '#7A7268', fontSize: 12.5, textDecoration: 'underline',
+        }}
+      >
+        Connecting a different Instagram account? Log out first →
       </button>
       {error && (
         <p style={{ marginTop: 20, fontSize: 13, color: '#E05252', background: '#1A0E0E', padding: '10px 14px', borderRadius: 8, border: '1px solid #3A1515', maxWidth: 420 }}>
