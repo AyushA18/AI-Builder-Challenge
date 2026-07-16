@@ -3,15 +3,36 @@ import { jsPDF } from 'jspdf'
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const DEFAULT_GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
-const IG_APP_ID = import.meta.env.VITE_INSTAGRAM_APP_ID
 const APP_URL = (import.meta.env.VITE_APP_URL || window.location.origin).replace(/\/$/, '')
 const REDIRECT_URI = `${APP_URL}/instagram`
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
-// Facebook Login for Business scopes — replaces the old Instagram Login scopes.
+
+// ── AUTH MODE TOGGLE ──────────────────────────────────────────────────────
+// 'facebook'  = Facebook Login for Business (requires a linked FB Page)
+// 'instagram' = Instagram API with Instagram Login (no FB Page needed)
+// Set VITE_IG_AUTH_MODE=instagram in Vercel to test the Instagram-only flow
+// without touching the working Facebook flow. Defaults to 'facebook'.
+const AUTH_MODE = (import.meta.env.VITE_IG_AUTH_MODE || 'facebook').trim()
+
+// Facebook Login for Business config.
 // pages_show_list / pages_read_engagement let us find the Page + linked IG account;
 // instagram_basic / instagram_manage_comments let us read media and comments.
-const IG_SCOPES = 'pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_comments'
+const FB_APP_ID = import.meta.env.VITE_INSTAGRAM_APP_ID
+const FB_IG_SCOPES = 'pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_comments'
 const FB_OAUTH_VERSION = 'v23.0'
+
+// Instagram API with Instagram Login config.
+// This is a SEPARATE app id/secret from the Facebook one — the "Instagram
+// App ID" shown on the Instagram product's own setup page in the Meta
+// dashboard, not the main Meta App ID.
+const IGL_APP_ID = import.meta.env.VITE_INSTAGRAM_LOGIN_APP_ID
+// New scope names (the old business_basic / business_manage_comments names
+// were deprecated by Meta on Jan 27, 2025).
+const IGL_SCOPES = 'instagram_business_basic,instagram_business_manage_comments'
+
+const IG_APP_ID = AUTH_MODE === 'instagram' ? IGL_APP_ID : FB_APP_ID
+const TOKEN_ENDPOINT = AUTH_MODE === 'instagram' ? '/api/instagram-login-token' : '/api/instagram-token'
+const PROXY_ENDPOINT = AUTH_MODE === 'instagram' ? '/api/instagram-login-proxy' : '/api/instagram-proxy'
 
 const MAX_COMMENTS = 50
 const LS_GROQ = 'pixelforge_groq_key'          // shared with Analyzer.jsx — same key
@@ -21,17 +42,26 @@ const SS_IG_PROFILE = 'pixelforge_ig_profile'  // cached { username, profile_pic
 
 // ─── HELPERS: FACEBOOK OAUTH (for Instagram Business access) ────────────────
 function buildAuthUrl() {
+  if (AUTH_MODE === 'instagram') {
+    const params = new URLSearchParams({
+      client_id: IG_APP_ID,
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      scope: IGL_SCOPES,
+    })
+    return `https://www.instagram.com/oauth/authorize?${params.toString()}`
+  }
   const params = new URLSearchParams({
     client_id: IG_APP_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
-    scope: IG_SCOPES,
+    scope: FB_IG_SCOPES,
   })
   return `https://www.facebook.com/${FB_OAUTH_VERSION}/dialog/oauth?${params.toString()}`
 }
 
 async function exchangeCodeForToken(code) {
-  const res = await fetch('/api/instagram-token', {
+  const res = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code, redirectUri: REDIRECT_URI }),
@@ -46,7 +76,7 @@ const MEDIA_FIELDS = 'id,caption,media_type,media_product_type,media_url,thumbna
 
 async function fetchRecentMedia(igUserId, accessToken) {
   const params = new URLSearchParams({ path: `${igUserId}/media`, accessToken, fields: MEDIA_FIELDS, limit: '12' })
-  const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
+  const res = await fetch(`${PROXY_ENDPOINT}?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error?.message || data.error || 'Failed to fetch your recent posts')
@@ -57,7 +87,7 @@ async function fetchRecentMedia(igUserId, accessToken) {
 async function fetchPostComments(mediaId, accessToken) {
   const fields = 'text,username,timestamp,like_count'
   const params = new URLSearchParams({ path: `${mediaId}/comments`, accessToken, fields, limit: String(MAX_COMMENTS) })
-  const res = await fetch(`/api/instagram-proxy?${params.toString()}`)
+  const res = await fetch(`${PROXY_ENDPOINT}?${params.toString()}`)
   const data = await res.json().catch(() => ({}))
 
   // ── TEMPORARY DEBUG LOGGING — remove once comments-on-reels is fixed ──
