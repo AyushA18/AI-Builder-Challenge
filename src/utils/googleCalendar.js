@@ -85,9 +85,9 @@ export async function getGoogleAccessToken() {
       reject(new Error(err?.message || 'Google sign-in was cancelled or failed'))
     }
 
-    // Only force the consent screen on the very first request in this session;
-    // GIS silently reuses the grant for subsequent token requests after that.
-    tokenClient.requestAccessToken({ prompt: cachedToken ? '' : 'consent' })
+    // Always show the account picker so the user can choose which Google account
+    // to add the calendar event to.
+    tokenClient.requestAccessToken({ prompt: 'select_account' })
   })
 }
 
