@@ -54,9 +54,8 @@ export async function getGoogleAccessToken() {
     throw new Error('Missing VITE_GOOGLE_CLIENT_ID — see GOOGLE_CALENDAR_SETUP.md')
   }
 
-  if (cachedToken && cachedToken.expires_at > Date.now() + 30_000) {
-    return cachedToken.access_token
-  }
+  // Always clear the cached token so the account picker is shown every time.
+  cachedToken = null
 
   await loadGisScript()
 
