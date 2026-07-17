@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { jsPDF } from 'jspdf'
+import { createCalendarEvent } from '../utils/googleCalendar'
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 // 👇 The Groq key is the DEFAULT key. Users can override it with their own key
@@ -558,8 +559,149 @@ ${commentCorpus}`
   )
 }
 
+// ─── SCHEDULE MODAL ──────────────────────────────────────────────────────────
+// Lets the user pick a date/time for a suggested video idea, then creates a
+// Google Calendar event for it. `idea` is { title, reason }.
+function ScheduleModal({ idea, onClose }) {
+  const defaultDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) // +3 days, a sane default
+  const [date, setDate] = useState(defaultDate.toISOString().slice(0, 10))
+  const [time, setTime] = useState('12:00')
+  const [status, setStatus] = useState('idle') // idle | saving | done | error
+  const [error, setError] = useState('')
+  const [eventLink, setEventLink] = useState('')
+
+  async function handleAdd() {
+    setStatus('saving')
+    setError('')
+    try {
+      const start = new Date(`${date}T${time}:00`)
+      const result = await createCalendarEvent({
+        title: `🎬 Post: ${idea.title}`,
+        description: `${idea.reason}\n\nSuggested by PixelForge based on comment analysis.`,
+        start,
+        end: new Date(start.getTime() + 60 * 60 * 1000), // 1hr placeholder block
+      })
+      setEventLink(result.htmlLink || '')
+      setStatus('done')
+    } catch (e) {
+      setError(e.message || 'Failed to create calendar event')
+      setStatus('error')
+    }
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+    }} onClick={onClose}>
+      <div
+        style={{
+          background: '#1A1815', border: '1px solid #2E2820', borderRadius: 14,
+          padding: 24, width: 380, maxWidth: '90vw',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 11, color: '#EF9F27', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>
+          Add to Content Calendar
+        </div>
+        <p style={{ fontSize: 14, fontWeight: 700, color: '#F0EBE3', marginBottom: 16, lineHeight: 1.4 }}>
+          {idea.title}
+        </p>
+
+        {status !== 'done' && (
+          <>
+            <label style={{ fontSize: 12, color: '#7A7268', display: 'block', marginBottom: 4 }}>Post date</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              style={{
+                width: '100%', padding: '8px 10px', marginBottom: 12,
+                background: '#0F0E0C', border: '1px solid #2E2820', borderRadius: 8,
+                color: '#F0EBE3', fontFamily: 'inherit', fontSize: 13,
+              }}
+            />
+            <label style={{ fontSize: 12, color: '#7A7268', display: 'block', marginBottom: 4 }}>Time</label>
+            <input
+              type="time"
+              value={time}
+              onChange={(e) => setTime(e.target.value)}
+              style={{
+                width: '100%', padding: '8px 10px', marginBottom: 18,
+                background: '#0F0E0C', border: '1px solid #2E2820', borderRadius: 8,
+                color: '#F0EBE3', fontFamily: 'inherit', fontSize: 13,
+              }}
+            />
+
+            {status === 'error' && (
+              <p style={{ fontSize: 12, color: '#E05252', marginBottom: 12 }}>{error}</p>
+            )}
+
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={onClose}
+                style={{
+                  flex: 1, padding: '10px', borderRadius: 8, border: '1px solid #2E2820',
+                  background: 'transparent', color: '#7A7268', fontWeight: 600, fontSize: 13,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAdd}
+                disabled={status === 'saving'}
+                style={{
+                  flex: 1, padding: '10px', borderRadius: 8, border: 'none',
+                  background: 'linear-gradient(135deg, #D85A30, #EF9F27)',
+                  color: '#fff', fontWeight: 700, fontSize: 13,
+                  opacity: status === 'saving' ? 0.7 : 1,
+                }}
+              >
+                {status === 'saving' ? 'Adding…' : 'Add to Calendar'}
+              </button>
+            </div>
+          </>
+        )}
+
+        {status === 'done' && (
+          <>
+            <p style={{ fontSize: 13, color: '#4CAF7D', marginBottom: 16 }}>
+              ✓ Added to your Google Calendar.
+            </p>
+            <div style={{ display: 'flex', gap: 10 }}>
+              {eventLink && (
+                <a
+                  href={eventLink}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    flex: 1, padding: '10px', borderRadius: 8, border: '1px solid #2E2820',
+                    color: '#EF9F27', fontWeight: 600, fontSize: 13, textAlign: 'center',
+                  }}
+                >
+                  View event
+                </a>
+              )}
+              <button
+                onClick={onClose}
+                style={{
+                  flex: 1, padding: '10px', borderRadius: 8, border: 'none',
+                  background: '#2E2820', color: '#F0EBE3', fontWeight: 700, fontSize: 13,
+                }}
+              >
+                Done
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── REPORT ──────────────────────────────────────────────────────────────────
 function Report({ data, commentCount }) {
+  const [schedulingIdea, setSchedulingIdea] = useState(null)
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       {/* Header */}
@@ -691,16 +833,30 @@ function Report({ data, commentCount }) {
               borderRadius: 10, border: '1px solid #2E2820',
             }}>
               <StepBadge n={i + 1} />
-              <div>
+              <div style={{ flex: 1 }}>
                 <p style={{ fontSize: 14, fontWeight: 700, color: '#EF9F27', marginBottom: 4 }}>
                   {v.title}
                 </p>
                 <p style={{ fontSize: 12, color: '#7A7268', lineHeight: 1.6 }}>{v.reason}</p>
               </div>
+              <button
+                onClick={() => setSchedulingIdea(v)}
+                style={{
+                  flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '8px 14px', borderRadius: 8, border: '1px solid #2E2820',
+                  background: '#0F0E0C', color: '#F0EBE3', fontWeight: 600, fontSize: 12,
+                }}
+              >
+                📅 Add to Calendar
+              </button>
             </div>
           ))}
         </div>
       </Card>
+
+      {schedulingIdea && (
+        <ScheduleModal idea={schedulingIdea} onClose={() => setSchedulingIdea(null)} />
+      )}
 
       {/* Audience Phrases */}
       <Card>
