@@ -20,6 +20,13 @@ const AUTH_MODE = (import.meta.env.VITE_IG_AUTH_MODE || 'facebook').trim()
 const FB_APP_ID = import.meta.env.VITE_INSTAGRAM_APP_ID
 const FB_IG_SCOPES = 'pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_comments'
 const FB_OAUTH_VERSION = 'v23.0'
+// Facebook Login for Business requires a Login Configuration (created in
+// Meta App Dashboard → Facebook Login for Business → Configurations) instead
+// of plain scopes — this is what actually grants business-scoped access to
+// Pages/IG accounts living inside a Business Portfolio. Without this, the
+// classic `scope=` param "works" (you get a token) but /me/accounts won't
+// reliably return Pages owned by a Business Portfolio.
+const FB_CONFIG_ID = import.meta.env.VITE_FACEBOOK_CONFIG_ID
 
 // Instagram API with Instagram Login config.
 // This is a SEPARATE app id/secret from the Facebook one — the "Instagram
@@ -55,7 +62,8 @@ function buildAuthUrl() {
     client_id: IG_APP_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
-    scope: FB_IG_SCOPES,
+    override_default_response_type: 'true',
+    config_id: FB_CONFIG_ID,
   })
   return `https://www.facebook.com/${FB_OAUTH_VERSION}/dialog/oauth?${params.toString()}`
 }
