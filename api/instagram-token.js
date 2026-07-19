@@ -8,6 +8,10 @@
 //
 // Flow:
 //   1. Frontend redirects the user to https://www.facebook.com/v23.0/dialog/oauth
+//      using a config_id (from a Login Configuration created under
+//      Facebook Login for Business → Configurations in the Meta App Dashboard)
+//      instead of a plain `scope` param — required for business-scoped access
+//      to Pages/Instagram accounts living inside a Business Portfolio.
 //   2. Facebook redirects back to {VITE_APP_URL}/instagram?code=...
 //   3. Frontend calls this function with { code, redirectUri }
 //   4. This function:
@@ -94,14 +98,6 @@ export default async function handler(req, res) {
     }
 
     const longLivedUserToken = longData.access_token
-
-    // ── TEMPORARY DIAGNOSTIC — remove once the empty-pages issue is fixed ──
-    // Tells us exactly which scopes Facebook actually granted vs declined for
-    // this login, since the UI can look like it went through even when a
-    // scope silently got dropped (e.g. pages_show_list not fully confirmed).
-    const permsRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/me/permissions?access_token=${longLivedUserToken}`)
-    const permsData = await permsRes.json()
-    console.log('[instagram-token] granted/declined permissions:', JSON.stringify(permsData))
 
     // ── Step 3: find the user's Pages, and the one with a linked IG Business Account ──
     const pagesParams = new URLSearchParams({
